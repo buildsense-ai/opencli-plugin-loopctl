@@ -1,4 +1,4 @@
-// loop-pending.ts
+// loop-fanout.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
@@ -61,6 +61,7 @@ var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId:
 var actionPacketSchema = z.discriminatedUnion("kind", [executePacket, reviewPacket, nextPacket]);
 
 // src/lib/events.ts
+import { posix } from "node:path";
 import { z as z2 } from "zod";
 var id2 = z2.string().min(1);
 var hash2 = z2.string().min(8);
@@ -76,9 +77,80 @@ var candidate = z2.object({ ...base, type: z2.literal("candidate_submitted"), pa
 var review = z2.object({ ...base, type: z2.literal("review_decided"), payload: z2.object({ workItemId: id2, expectedRevision: z2.number().int().positive(), candidateId: id2, outcome: z2.enum(["accepted", "changes_requested"]), reviewerPrincipal: id2, authenticationRef: id2.optional(), reviewerProof: id2.optional(), reviewedHeadSha: id2, reviewedDeliverableDigest: hash2, acceptanceContractHash: hash2 }).strict() }).strict();
 var planEvent = z2.union([registered, bundle]);
 var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
+function parseFanout(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("fanout file is not valid JSON");
+  }
+  if (!Array.isArray(value) || value.length < 4 || value.length % 2 !== 0) throw new Error("fanout file must contain at least two registration/bundle pairs");
+  const parsed = value.map((item) => planEvent.parse(item));
+  const loopIds = new Set(parsed.filter((e) => e.type === "work_item_registered").map((e) => e.payload.loopId));
+  if (loopIds.size !== 1) throw new Error("fanout plans must share one loopId");
+  const workItems = /* @__PURE__ */ new Set(), attempts = /* @__PURE__ */ new Set(), branches = /* @__PURE__ */ new Set(), paths = /* @__PURE__ */ new Set(), leases = /* @__PURE__ */ new Set(), eventIds = /* @__PURE__ */ new Set(), idempotencyKeys = /* @__PURE__ */ new Set();
+  for (let i = 0; i < parsed.length; i += 2) {
+    const r = parsed[i], b = parsed[i + 1];
+    if (r.type !== "work_item_registered" || b.type !== "work_bundle_proposed") throw new Error("fanout must contain registration/bundle pairs");
+    for (const event of [r, b]) {
+      if (eventIds.has(event.eventId) || idempotencyKeys.has(event.idempotencyKey)) throw new Error("fanout event IDs and idempotency keys must be unique");
+      eventIds.add(event.eventId);
+      idempotencyKeys.add(event.idempotencyKey);
+    }
+    if (r.payload.workItemId !== b.payload.workItemId || b.payload.expectedRevision !== 1) throw new Error("fanout pair identity or revision mismatch");
+    if (workItems.has(r.payload.workItemId) || attempts.has(b.payload.attemptId)) throw new Error("fanout IDs must be unique");
+    const marker = "LOOP_WORKTREE_CONTRACT_V1=";
+    const lines = b.payload.workBundle.instructions.split("\n").filter((value2) => value2.startsWith(marker));
+    if (lines.length !== 1) throw new Error("fanout bundle requires exactly one LOOP_WORKTREE_CONTRACT_V1 line");
+    let wt;
+    try {
+      wt = worktreeContract.parse(JSON.parse(lines[0].slice(marker.length)));
+    } catch {
+      throw new Error("fanout worktree contract is invalid");
+    }
+    if (!posix.isAbsolute(wt.worktreePath) || posix.normalize(wt.worktreePath) !== wt.worktreePath) throw new Error("fanout worktreePath must be normalized and absolute");
+    const normalizedPath = wt.worktreePath;
+    if (wt.repository !== r.payload.githubRepo) throw new Error("worktree repository must match githubRepo");
+    if (!wt.branchName.startsWith(`loop/${r.payload.loopId}/`)) throw new Error("worktree branch must be scoped to loopId");
+    if (branches.has(wt.branchName) || paths.has(normalizedPath) || leases.has(wt.workspaceLease)) throw new Error("fanout worktrees and workspace leases must be unique");
+    workItems.add(r.payload.workItemId);
+    attempts.add(b.payload.attemptId);
+    branches.add(wt.branchName);
+    paths.add(normalizedPath);
+    leases.add(wt.workspaceLease);
+    parsePlan(JSON.stringify([r, b]));
+  }
+  return parsed;
+}
+function parsePlan(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("plan file is not valid JSON");
+  }
+  if (!Array.isArray(value) || value.length !== 2) throw new Error("plan file must be an array of exactly two events");
+  const parsed = value.map((item) => planEvent.parse(item));
+  const registration = parsed[0], proposed = parsed[1];
+  if (registration.type !== "work_item_registered" || proposed.type !== "work_bundle_proposed") throw new Error("plan must contain work_item_registered followed by work_bundle_proposed");
+  const r = registration.payload, b = proposed.payload;
+  if (r.workItemId !== b.workItemId) throw new Error("plan Work Item IDs must match");
+  if (b.expectedRevision !== 1) throw new Error("new plan bundle expectedRevision must be 1");
+  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (r[key] !== b[key]) throw new Error(`plan contract mismatch: ${key}`);
+  if (!r.workerTopicId || !r.stewardTopicId || r.workerTopicId === r.stewardTopicId) throw new Error("plan requires distinct worker and steward topics");
+  const numericCatscoPrincipal = /^catsco-user:[1-9]\d*$/;
+  if (r.stewardTopicId.startsWith("grp_") && (!r.stewardPrincipal || !numericCatscoPrincipal.test(r.stewardPrincipal))) throw new Error("group Steward topic requires a numeric CatsCo principal");
+  if (r.stewardPrincipal !== void 0 && !r.stewardPrincipal.startsWith("catsco-user:")) throw new Error("plan stewardPrincipal must be a CatsCo principal");
+  if ((b.proofMode ?? "ed25519") === "catsco-message" && !b.runtimePrincipal.startsWith("catsco-user:")) throw new Error("CatsCo-message bundle requires a CatsCo runtime principal");
+  if (b.proofMode === "ed25519" && (!b.proofKeyId || !b.proofPublicKey)) throw new Error("Ed25519 bundle requires proof key fields");
+  return parsed;
+}
 
 // src/lib/loopctl.ts
 import { spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { realpath, lstat, open } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
@@ -127,6 +199,26 @@ async function runLoopctl(args, input) {
     child.stdin.end(input ?? "");
   });
 }
+async function readConfinedFile(file) {
+  if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
+  const cwd = resolve(process.cwd());
+  const requested = resolve(cwd, file);
+  const info = await lstat(requested);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("input file must be a regular non-symlink file");
+  const actual = await realpath(requested);
+  const rel = relative(cwd, actual);
+  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
+  const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("input file must remain a regular file");
+    const value = await handle.readFile("utf8");
+    if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
+    return value;
+  } finally {
+    await handle.close();
+  }
+}
 var unwrap = (value) => {
   if (value && typeof value === "object" && "data" in value) return value.data;
   return value;
@@ -140,10 +232,29 @@ var parseResponse = (schema, value, label) => {
     throw new CommandExecutionError2(`loopctl returned malformed ${label} JSON`);
   }
 };
-async function pending() {
-  const value = parseResponse(statusSchema, unwrap(await runLoopctl(["status"])), "status");
-  return { actions: value.actions.filter((a) => a.state === "ready"), current: value.workItems.filter((w) => ["assigned", "in_progress", "candidate", "changes_requested"].includes(w.state)) };
+var assertAcceptedReceipt = (value) => {
+  const receipt = parseResponse(receiptSchema, value, "receipt");
+  if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
+  return receipt;
+};
+async function ingest(event) {
+  return assertAcceptedReceipt(unwrap(await runLoopctl(["ingest", "--file", "-"], `${JSON.stringify(event)}
+`)));
+}
+async function tick() {
+  return parseResponse(tickSchema, unwrap(await runLoopctl(["tick"])), "tick");
+}
+async function fanout(kwargs) {
+  let events;
+  try {
+    events = parseFanout(await readConfinedFile(String(kwargs["plan-file"])));
+  } catch (error) {
+    throw new ArgumentError(error instanceof Error ? error.message : "invalid fanout file");
+  }
+  const receipts = [];
+  for (const event of events) receipts.push(await ingest(event));
+  return { count: events.length / 2, receipts, tick: await tick() };
 }
 
-// loop-pending.ts
-cli({ site: "loop", name: "pending", description: "List ready Actions and current Work Items", access: "read", browser: false, strategy: Strategy.LOCAL, args: [], columns: ["actions", "current"], defaultFormat: "json", func: pending });
+// loop-fanout.ts
+cli({ site: "loop", name: "fanout", description: "Review-only: register and dispatch multiple independent Work Item plans", access: "write", browser: false, strategy: Strategy.LOCAL, args: [{ name: "plan-file", help: "Fan-out JSON file containing registration/bundle pairs", required: true }], columns: ["count", "receipts", "tick"], defaultFormat: "json", func: fanout });

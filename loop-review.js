@@ -27,7 +27,8 @@ var tickSchema = z.object({
     ownerMismatch: z.boolean()
   }).strict()
 }).strict();
-var row = z.object({ workItemId: id, revision: z.number().int().positive(), state: id, profileId: id }).passthrough();
+var row = z.object({ workItemId: id, revision: z.number().int().positive(), state: id, loopId: id, profileId: id }).passthrough();
+var statusCandidate = z.object({ candidateId: id, workItemId: id, workItemRevision: z.number().int().positive(), repository: id, prNumber: z.number().int().positive(), headSha: id, digest: hash }).strict();
 var action = z.object({ actionId: id, actionKey: id, kind: z.enum(["execute_attempt", "review_candidate", "plan_next"]), state: id, workItemId: id, workItemRevision: z.number().int().positive() }).passthrough();
 var statusSchema = z.object({
   ownerUid: id,
@@ -37,7 +38,7 @@ var statusSchema = z.object({
   outbox: z.array(z.unknown()),
   workItems: z.array(row),
   attempts: z.array(z.unknown()),
-  candidates: z.array(z.unknown()),
+  candidates: z.array(statusCandidate),
   actions: z.array(action)
 }).passthrough();
 var packetBase = {
@@ -67,6 +68,7 @@ var base = { eventId: id2, idempotencyKey: id2, source: id2, entityRef: id2 };
 var contracts = { taskContractHash: hash2, referenceSnapshotHash: hash2, writeScopeHash: hash2, acceptanceContractHash: hash2 };
 var deliverable = z2.object({ kind: z2.literal("github_pr"), repository: id2, prNumber: z2.number().int().positive(), headSha: id2, baseSha: id2, digest: hash2 }).strict();
 var registered = z2.object({ ...base, type: z2.literal("work_item_registered"), payload: z2.object({ workItemId: id2, loopId: id2, profileId: id2, terminalState: z2.enum(["accepted", "closed"]), ...contracts, writeScope: z2.array(id2), githubRepo: id2, catscoProjectId: id2, workerTopicId: id2, stewardTopicId: id2, stewardPrincipal: id2.optional() }).strict() }).strict();
+var worktreeContract = z2.object({ repository: id2, baseRevision: id2, branchName: id2, worktreePath: id2, cleanupPolicy: z2.enum(["retain-until-review", "retain-until-integration", "remove-after-candidate"]), workspaceLease: id2 }).strict();
 var bundlePayload = z2.object({ workItemId: id2, expectedRevision: z2.number().int().positive(), attemptId: id2, attemptNumber: z2.number().int().positive(), generation: z2.number().int().nonnegative(), runtimePrincipal: id2, proofMode: z2.enum(["ed25519", "catsco-message"]).optional(), proofKeyId: id2.optional(), proofPublicKey: id2.optional(), leaseExpiresAt: z2.string().datetime(), workBundle: z2.object({ contractDigest: hash2, instructions: id2, deliverables: z2.array(id2) }).strict(), ...contracts }).strict();
 var bundle = z2.object({ ...base, type: z2.literal("work_bundle_proposed"), payload: bundlePayload }).strict();
 var runtimeStarted = z2.object({ ...base, type: z2.literal("runtime_started"), payload: z2.object({ workItemId: id2, expectedRevision: z2.number().int().positive(), attemptId: id2, generation: z2.number().int().nonnegative(), runtimePrincipal: id2, signature: z2.literal("catsco-message-attested") }).strict() }).strict();
@@ -77,6 +79,7 @@ var canonical = (value) => Array.isArray(value) ? value.map(canonical) : value &
 function canonicalJson(value) {
   return JSON.stringify(canonical(value));
 }
+var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 function parseEvent(raw, expected) {
   return expected.parse(JSON.parse(raw));
 }

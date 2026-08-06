@@ -24,11 +24,12 @@ export const tickSchema = z.object({
   }).strict()
 }).strict()
 
-const row = z.object({ workItemId: id, revision: z.number().int().positive(), state: id, profileId: id }).passthrough()
+const row = z.object({ workItemId: id, revision: z.number().int().positive(), state: id, loopId: id, profileId: id }).passthrough()
+const statusCandidate = z.object({ candidateId: id, workItemId: id, workItemRevision: z.number().int().positive(), repository: id, prNumber: z.number().int().positive(), headSha: id, digest: hash }).strict()
 const action = z.object({ actionId: id, actionKey: id, kind: z.enum(['execute_attempt', 'review_candidate', 'plan_next']), state: id, workItemId: id, workItemRevision: z.number().int().positive() }).passthrough()
 export const statusSchema = z.object({
   ownerUid: id, ledgerRevision: z.number().int().nonnegative(), inbox: z.array(z.unknown()), ingressConflicts: z.unknown(),
-  outbox: z.array(z.unknown()), workItems: z.array(row), attempts: z.array(z.unknown()), candidates: z.array(z.unknown()), actions: z.array(action)
+  outbox: z.array(z.unknown()), workItems: z.array(row), attempts: z.array(z.unknown()), candidates: z.array(statusCandidate), actions: z.array(action)
 }).passthrough()
 
 const packetBase = {

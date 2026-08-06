@@ -1,6 +1,6 @@
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
-import { bundle, candidate, parseEvent, parsePlan, registered, review, runtimeStarted } from './events.js'
+import { bundle, candidate, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
 
 const asObject=(value:unknown):Record<string,unknown>=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new CommandExecutionError('loopctl returned a non-object JSON value');return value as Record<string,unknown>}
@@ -14,6 +14,36 @@ async function tick(){return parseResponse(tickSchema,unwrap(await runLoopctl(['
 const readPlan=async(file:string)=>{try{return parsePlan(await readConfinedFile(file))}catch(error){throw new ArgumentError(error instanceof Error?error.message:'invalid plan file')}}
 const readEvent=async(file:string,schema:any)=>{try{return parseEvent(await readConfinedFile(file),schema)}catch(error){throw new ArgumentError(error instanceof Error?error.message:'invalid event file')}}
 export async function start(kwargs:any){const events=await readPlan(String(kwargs['plan-file']));const receipts=[];receipts.push(await ingest(events[0]));receipts.push(await ingest(events[1]));return {receipts,tick:await tick()}}
+export async function fanout(kwargs:any){
+  let events: any[]
+  try { events=parseFanout(await readConfinedFile(String(kwargs['plan-file']))) } catch(error) { throw new ArgumentError(error instanceof Error?error.message:'invalid fanout file') }
+  const receipts=[]
+  for(const event of events) receipts.push(await ingest(event))
+  return {count:events.length/2,receipts,tick:await tick()}
+}
+export async function integrate(kwargs:any){
+  let plan: ReturnType<typeof parseIntegrationPlan>
+  try { plan=parseIntegrationPlan(await readConfinedFile(String(kwargs['plan-file']))) } catch(error) { throw new ArgumentError(error instanceof Error?error.message:'invalid integration plan') }
+  const integrationRegistration=plan.events[0]
+  if(integrationRegistration.type!=='work_item_registered') throw new ArgumentError('integration plan must start with registration')
+  const current=await status({})
+  const loopItems=current.workItems.filter(row=>row.loopId===integrationRegistration.payload.loopId&&row.workItemId!==integrationRegistration.payload.workItemId)
+  const declared=new Set(plan.inputs.map(input=>input.workItemId))
+  const missing=plan.inputs.filter(input=>{
+    const item=current.workItems.find(row=>row.workItemId===input.workItemId)
+    const candidate=current.candidates.find((row:any)=>row.workItemId===input.workItemId&&row.candidateId===input.candidateId)
+    return !item||item.loopId!==integrationRegistration.payload.loopId||!['accepted','closed'].includes(item.state)||!candidate||candidate.repository!==input.repository||candidate.prNumber!==input.prNumber||candidate.headSha!==input.headSha||candidate.digest!==input.digest
+  })
+  const unfinished=loopItems.filter(item=>!['accepted','closed'].includes(item.state))
+  const omitted=loopItems.filter(item=>!declared.has(item.workItemId))
+  if(missing.length||unfinished.length||omitted.length) {
+    const ids=[...new Set([...missing.map(input=>input.workItemId),...unfinished.map(item=>item.workItemId),...omitted.map(item=>item.workItemId)])]
+    throw new ArgumentError(`integration barrier is not satisfied for: ${ids.join(', ')}`)
+  }
+  const receipts=[]
+  for(const event of plan.events) receipts.push(await ingest(event))
+  return {inputCount:plan.inputs.length,receipts,tick:await tick()}
+}
 export async function bundleCommand(kwargs:any){const event=await readEvent(String(kwargs['event-file']),bundle);return {receipt:await ingest(event),tick:await tick()}}
 import { canonicalJson } from './events.js'
 export async function builder(kwargs:any,schema:any){const event=await readEvent(String(kwargs['event-file']),schema);return JSON.parse(canonicalJson(event))}

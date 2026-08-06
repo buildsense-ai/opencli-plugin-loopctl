@@ -21,7 +21,7 @@ opencli loop review --event-file events/review.json
 opencli loop next --plan-next-action-id ACTION_ID --plan-file plans/next.json
 ```
 
-The eleven commands are:
+The eleven commands are available to the explicit Loop mode:
 
 - `status [--work-item ID]` — delegate to `loopctl status`.
 - `pending` — list ready Actions and current Work Items.
@@ -35,13 +35,15 @@ The eleven commands are:
 
 ## Review and Worker flow
 
-The human supplies natural language only to the Review Agent.
+Loop is opt-in, not the default behavior. For an ordinary human request, Review remains a normal Agent and may answer, inspect, or modify through the host's usual workflow. Review enters Loop mode only when the human explicitly asks to use Loop, start a Loop, use `loopctl`, split work into Loop Work Items, or run parallel Loop tasks. A Controller Action continues an already-started Loop; a structured group mention only wakes Review and does not select Loop by itself.
+
+When Loop mode is explicitly active, the human supplies natural language only to the Review Agent.
 
 P2P is the default: Review uses its current private topic as `stewardTopicId`, and resolves the selected Worker's existing private P2P topic through `opencli catsco agents`/`open` as `workerTopicId`. These topics remain distinct and no group or mention is needed.
 
 Fallback for multiple human supervisors: Review may explicitly use an existing multi-member `grp_*` conversation as `stewardTopicId`. In that mode, a human must structurally mention Review; visible `@name` text is not a wake signal. This changes only Review's human interaction surface; Worker dispatch remains private P2P.
 
-Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. For independent parallel work, Review uses `opencli loop fanout`; each bundle carries a `LOOP_WORKTREE_CONTRACT_V1` instruction with a unique branch, worktree path, base revision, cleanup policy, and workspace lease. After all required Candidates are accepted, Review uses `opencli loop integrate`; the command fails closed unless every declared Candidate input is present behind an accepted/closed Work Item. Controller sends `execute_attempt` privately to Worker P2P. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
+In explicit Loop mode, Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. For independent parallel work, Review uses `opencli loop fanout`; each bundle carries a `LOOP_WORKTREE_CONTRACT_V1` instruction with a unique branch, worktree path, base revision, cleanup policy, and workspace lease. After all required Candidates are accepted, Review uses `opencli loop integrate`; the command fails closed unless every declared Candidate input is present behind an accepted/closed Work Item. Controller sends `execute_attempt` privately to Worker P2P. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
 
 Review inspects `review_candidate` packets with Bash, `gh`, and tests, then sends the exact output of `opencli loop review` as its CatsCo reply.
 

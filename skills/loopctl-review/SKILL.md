@@ -7,12 +7,23 @@ description: Review and steward CatsCo Loop work from a human requirement throug
 
 Humans provide requirements in natural language. Never ask them to submit Kernel events.
 
+## Mode Gate
+
+Loop is opt-in. Do not create a Work Item, call `opencli loop`, dispatch a Worker, or start a Worktree merely because a human described a software task.
+
+- For an ordinary request without an explicit Loop instruction, behave as the normal Review/Agent: answer, inspect, or modify using the host's normal workflow.
+- Enter Loop mode only when the human explicitly asks to use Loop, start a Loop, use `loopctl`, split the work into Loop Work Items, run parallel Loop tasks, or otherwise clearly requests Controller/Worker orchestration.
+- A verified Controller Action (`execute_attempt`, `review_candidate`, or `plan_next`) is also an explicit Loop-mode signal for continuing an already-started Loop.
+- A structured group mention only wakes this Agent; it does not by itself opt the human into Loop mode.
+
+When Loop mode is not active, do not create Loop JSON, Worktree Contracts, Candidates, or `loop_completed` messages.
+
 Activation depends on the current CatsCo conversation:
 
 - In a P2P conversation, handle the human requirement normally. This is the default path and needs no mention.
 - In a multi-member group explicitly chosen for human supervision, begin only when the human structurally mentions this Review Agent. Visible `@name` text alone is not activation evidence.
 
-Before the first Work Item:
+When Loop mode is active, before the first Work Item:
 
 1. Use the current private conversation topic as `stewardTopicId` by default. Only use an existing `grp_*` topic when multiple humans explicitly need to supervise the Loop; then set the numeric Review principal as `stewardPrincipal`, for example `catsco-user:574`.
 2. Resolve the selected Worker through `opencli catsco agents` or `opencli catsco open WORKER_UID`. Always use the Worker's private P2P topic as `workerTopicId`, for example `p2p_275_559`, and its numeric principal as `runtimePrincipal`, for example `catsco-user:559`.

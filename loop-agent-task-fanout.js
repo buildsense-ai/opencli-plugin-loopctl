@@ -123,6 +123,24 @@ function parseFanout(raw) {
   }
   return parsed;
 }
+function parseAgentTaskFanout(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("agent-task fanout file is not valid JSON");
+  }
+  if (!Array.isArray(value) || value.length < 4 || value.length % 2 !== 0) throw new Error("agent-task fanout file must contain at least two registration/bundle pairs");
+  const parsed = value.map((item) => planEvent.parse(item));
+  const provisional = parsed.map((event, index) => {
+    if (index % 2 !== 0 || event.type !== "work_item_registered") return event;
+    const match = /^agent-task:([1-9]\d*)$/.exec(event.payload.workerTopicId);
+    if (!match) throw new Error(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${event.payload.workItemId}`);
+    return { ...event, payload: { ...event.payload, workerTopicId: `agent-task:${match[1]}:${event.payload.workItemId}` } };
+  });
+  parseFanout(JSON.stringify(provisional));
+  return parsed;
+}
 function parsePlan(raw) {
   let value;
   try {
@@ -317,7 +335,7 @@ async function tick() {
 async function agentTaskFanout(kwargs) {
   let events;
   try {
-    events = parseFanout(await readConfinedFile(String(kwargs["plan-file"])));
+    events = parseAgentTaskFanout(await readConfinedFile(String(kwargs["plan-file"])));
   } catch (error) {
     throw new ArgumentError(error instanceof Error ? error.message : "invalid agent-task fanout file");
   }

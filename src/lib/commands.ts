@@ -1,6 +1,6 @@
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
-import { bundle, candidate, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
+import { bundle, candidate, parseAgentTaskFanout, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
 import { createAgentTaskTopic } from './catsco.js'
 
@@ -24,7 +24,7 @@ export async function fanout(kwargs:any){
 }
 export async function agentTaskFanout(kwargs:any){
   let events: any[]
-  try { events=parseFanout(await readConfinedFile(String(kwargs['plan-file']))) } catch(error) { throw new ArgumentError(error instanceof Error?error.message:'invalid agent-task fanout file') }
+  try { events=parseAgentTaskFanout(await readConfinedFile(String(kwargs['plan-file']))) } catch(error) { throw new ArgumentError(error instanceof Error?error.message:'invalid agent-task fanout file') }
   const provisionedTopics: Array<{ workItemId: string; attemptId: string; topic: string; groupId: string }> = []
   const rewritten: any[] = []
   for(let index=0; index<events.length; index+=2) {

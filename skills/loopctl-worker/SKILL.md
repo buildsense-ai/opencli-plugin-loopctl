@@ -1,6 +1,6 @@
 ---
 name: loopctl-worker
-description: Execute a fenced CatsCo Loop attempt received on the Worker's private P2P topic and submit authenticated runtime_started and Candidate events.
+description: Execute a fenced CatsCo Loop Attempt received on its dedicated CatsCo Agent Task topic and submit authenticated runtime_started and Candidate events.
 ---
 
 # Loop Controller Worker Agent

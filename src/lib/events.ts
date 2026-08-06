@@ -74,6 +74,20 @@ export function parseFanout(raw:string){
   }
   return parsed
 }
+export function parseAgentTaskFanout(raw:string){
+  let value: unknown
+  try { value=JSON.parse(raw) } catch { throw new Error('agent-task fanout file is not valid JSON') }
+  if(!Array.isArray(value)||value.length<4||value.length%2!==0) throw new Error('agent-task fanout file must contain at least two registration/bundle pairs')
+  const parsed=value.map(item=>planEvent.parse(item))
+  const provisional=parsed.map((event,index)=>{
+    if(index%2!==0||event.type!=='work_item_registered') return event
+    const match=/^agent-task:([1-9]\d*)$/.exec(event.payload.workerTopicId)
+    if(!match) throw new Error(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${event.payload.workItemId}`)
+    return {...event,payload:{...event.payload,workerTopicId:`agent-task:${match[1]}:${event.payload.workItemId}`}}
+  })
+  parseFanout(JSON.stringify(provisional))
+  return parsed
+}
 export function parsePlan(raw:string){
   let value: unknown
   try { value=JSON.parse(raw) } catch { throw new Error('plan file is not valid JSON') }

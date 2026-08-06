@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseFanout, parseIntegrationPlan, parsePlan, runtimeStarted } from '../src/lib/events.js'
+import { parseAgentTaskFanout, parseFanout, parseIntegrationPlan, parsePlan, runtimeStarted } from '../src/lib/events.js'
 
 describe('strict Agent event builders', () => {
   it('rejects prototype or identity fields outside the existing event schema', () => {
@@ -31,5 +31,12 @@ describe('strict Agent event builders', () => {
       return [registration,bundle]
     }
     expect(() => parseFanout(JSON.stringify([...sharedTopicPair('a','559','loop/loop-1/a','/tmp/a'),...sharedTopicPair('b','560','loop/loop-1/b','/tmp/b')]))).toThrow(/worker topics/)
+    const [agentTaskA, agentTaskBundleA]=pair('agent-a','attempt-agent-a','loop/loop-1/agent-a','/tmp/agent-a')
+    const [agentTaskB, agentTaskBundleB]=pair('agent-b','attempt-agent-b','loop/loop-1/agent-b','/tmp/agent-b')
+    agentTaskA.payload.workerTopicId='agent-task:559'
+    agentTaskB.payload.workerTopicId='agent-task:559'
+    agentTaskBundleA.payload.runtimePrincipal='catsco-user:559'
+    agentTaskBundleB.payload.runtimePrincipal='catsco-user:559'
+    expect(parseAgentTaskFanout(JSON.stringify([agentTaskA,agentTaskBundleA,agentTaskB,agentTaskBundleB]))).toHaveLength(4)
   })
 })

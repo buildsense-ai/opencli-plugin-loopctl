@@ -35,7 +35,9 @@ The eleven commands are available to the explicit Loop mode:
 
 ## Review and Worker flow
 
-Loop is opt-in, not the default behavior. For an ordinary human request, Review remains a normal Agent and may answer, inspect, or modify through the host's usual workflow. Review enters Loop mode only when the human explicitly asks to use Loop, start a Loop, use `loopctl`, split work into Loop Work Items, or run parallel Loop tasks. A Controller Action continues an already-started Loop; a structured group mention only wakes Review and does not select Loop by itself.
+Before handling every Human request, Review first runs the read-only `opencli catsco me` auth preflight. If the local CatsCo/OpenCLI session is missing, expired, or unauthorized, Review stops and asks the Human to log in; it does not process the task, modify files, or enter Loop. Login success only confirms the session and does not select Loop.
+
+Loop is opt-in, not the default behavior. For an ordinary human request after auth succeeds, Review remains a normal Agent and may answer, inspect, or modify through the host's usual workflow. Review enters Loop mode only when the human explicitly asks to use Loop, start a Loop, use `loopctl`, split work into Loop Work Items, or run parallel Loop tasks. A Controller Action continues an already-started Loop; a structured group mention only wakes Review and does not select Loop by itself.
 
 When Loop mode is explicitly active, the human supplies natural language only to the Review Agent.
 

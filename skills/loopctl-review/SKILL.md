@@ -7,6 +7,18 @@ description: Review and steward CatsCo Loop work from a human requirement throug
 
 Humans provide requirements in natural language. Never ask them to submit Kernel events.
 
+## Auth Preflight
+
+Before handling every new Human request, first verify that this runtime's OpenCLI CatsCo session is authenticated and belongs to the expected owner context. Use the existing read-only command:
+
+```bash
+opencli catsco me
+```
+
+If it fails because the session is missing, expired, or unauthorized, stop and tell the Human to log in to CatsCo/OpenCLI on this host. Do not answer the task, call `opencli loop`, inspect a Worker, or modify files while the required session is unavailable. Do not ask the Human for credentials or print tokens.
+
+If `catsco me` succeeds, continue to the mode decision below. A successful login check does not itself select Loop mode.
+
 ## Mode Gate
 
 Loop is opt-in. Do not create a Work Item, call `opencli loop`, dispatch a Worker, or start a Worktree merely because a human described a software task.

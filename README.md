@@ -31,7 +31,18 @@ The nine commands are:
 
 ## Review and Worker flow
 
-The human supplies natural language only to the Review Agent. Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. Review inspects `review_candidate` packets with Bash, `gh`, and tests, then sends the exact output of `opencli loop review` as its CatsCo reply.
+The human supplies natural language only to the Review Agent. In a multi-member group, the human must structurally mention Review; visible `@name` text is not a wake signal.
+
+Review creates or reuses one standard collaboration group containing Review and Worker:
+
+```bash
+opencli catsco group-create "Loop: <goal>" <review-uid>,<worker-uid>
+opencli catsco group-invite <group-id> <missing-uid>
+```
+
+After verifying membership, Review uses that same `grp_*` topic for both `workerTopicId` and `stewardTopicId`, with explicit numeric CatsCo principals. Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. Controller transport derives `mentions:["usr<target-uid>"]` from each Action's target principal, so `execute_attempt` wakes Worker while `review_candidate` and `plan_next` wake Review in the same group. Packet content and protocol events remain unchanged.
+
+Review inspects `review_candidate` packets with Bash, `gh`, and tests, then sends the exact output of `opencli loop review` as its CatsCo reply.
 
 The Worker accepts only an `execute_attempt` packet. It sends the exact `runtime-started` output first through the existing CatsCo reply capability, performs bounded Bash/Git/`gh` work within the packet's contracts, scope, and lease, and sends the exact Candidate output afterward.
 
@@ -78,4 +89,4 @@ This plugin does not modify XiaoBa-CLI, CatsCo, Kernel transitions, protocol eve
 
 ## Residual P0 limits
 
-The integration retains the existing P0 limits: existing CatsCo topics only; bounded 200-message polling; Review is co-located with `loopctl`; Agents must send builder output verbatim; and there is no durable `loop_completed` event. Completion is represented by no next Work Item plus a human-facing completion report.
+The integration retains these P0 limits: bounded 200-message polling; Review is co-located with `loopctl`; group creation and membership remain Review operations rather than Kernel facts; Agents must send builder output verbatim; and there is no durable `loop_completed` event. Completion is represented by no next Work Item plus a human-facing completion report.

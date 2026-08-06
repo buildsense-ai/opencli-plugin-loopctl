@@ -25,7 +25,11 @@ export function parsePlan(raw:string){
   if(r.workItemId!==b.workItemId) throw new Error('plan Work Item IDs must match')
   if(b.expectedRevision!==1) throw new Error('new plan bundle expectedRevision must be 1')
   for(const key of ['taskContractHash','referenceSnapshotHash','writeScopeHash','acceptanceContractHash'] as const) if(r[key]!==b[key]) throw new Error(`plan contract mismatch: ${key}`)
-  if(!r.workerTopicId||!r.stewardTopicId||r.workerTopicId===r.stewardTopicId) throw new Error('plan requires distinct worker and steward topics')
+  if(!r.workerTopicId||!r.stewardTopicId) throw new Error('plan requires worker and steward topics')
+  const sharedTopic=r.workerTopicId===r.stewardTopicId
+  if(sharedTopic&&!r.workerTopicId.startsWith('grp_')) throw new Error('shared topic must be a CatsCo group topic')
+  const numericCatscoPrincipal=/^catsco-user:[1-9]\d*$/
+  if(sharedTopic&&(!r.stewardPrincipal||!numericCatscoPrincipal.test(r.stewardPrincipal)||!numericCatscoPrincipal.test(b.runtimePrincipal))) throw new Error('shared group requires numeric CatsCo principals for Steward and Worker')
   if(r.stewardPrincipal!==undefined&&!r.stewardPrincipal.startsWith('catsco-user:')) throw new Error('plan stewardPrincipal must be a CatsCo principal')
   if((b.proofMode??'ed25519')==='catsco-message'&&!b.runtimePrincipal.startsWith('catsco-user:')) throw new Error('CatsCo-message bundle requires a CatsCo runtime principal')
   if(b.proofMode==='ed25519'&&(!b.proofKeyId||!b.proofPublicKey)) throw new Error('Ed25519 bundle requires proof key fields')

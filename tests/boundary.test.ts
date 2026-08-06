@@ -37,17 +37,15 @@ describe('OpenCLI boundary safety',()=>{
     expect(()=>parsePlan(JSON.stringify([registration,bundle]))).toThrow(/IDs/)
   })
 
-  it('accepts one collaboration group for Worker and Steward when both principals are addressable',()=>{
-    const registration={type:'work_item_registered',eventId:'r',idempotencyKey:'r',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',loopId:'l',profileId:'p',terminalState:'accepted',taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash',writeScope:['src/**'],githubRepo:'org/repo',catscoProjectId:'project',workerTopicId:'grp_1400',stewardTopicId:'grp_1400',stewardPrincipal:'catsco-user:574'}}
+  it('keeps Worker execution private while Review uses a collaboration group',()=>{
+    const registration={type:'work_item_registered',eventId:'r',idempotencyKey:'r',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',loopId:'l',profileId:'p',terminalState:'accepted',taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash',writeScope:['src/**'],githubRepo:'org/repo',catscoProjectId:'project',workerTopicId:'p2p_275_559',stewardTopicId:'grp_1348',stewardPrincipal:'catsco-user:574'}}
     const bundle={type:'work_bundle_proposed',eventId:'b',idempotencyKey:'b',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',expectedRevision:1,attemptId:'a',attemptNumber:1,generation:1,runtimePrincipal:'catsco-user:559',proofMode:'catsco-message',leaseExpiresAt:'2030-01-01T00:00:00.000Z',workBundle:{contractDigest:'bundle-hash',instructions:'do work',deliverables:['PR']},taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash'}}
     expect(parsePlan(JSON.stringify([registration,bundle]))).toHaveLength(2)
   })
 
-  it('rejects a shared non-group topic or non-numeric group principal',()=>{
-    const registration={type:'work_item_registered',eventId:'r',idempotencyKey:'r',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',loopId:'l',profileId:'p',terminalState:'accepted',taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash',writeScope:['src/**'],githubRepo:'org/repo',catscoProjectId:'project',workerTopicId:'shared',stewardTopicId:'shared',stewardPrincipal:'catsco-user:574'}}
+  it('requires a numeric Review principal for a group Steward topic',()=>{
+    const registration={type:'work_item_registered',eventId:'r',idempotencyKey:'r',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',loopId:'l',profileId:'p',terminalState:'accepted',taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash',writeScope:['src/**'],githubRepo:'org/repo',catscoProjectId:'project',workerTopicId:'p2p_275_559',stewardTopicId:'grp_1348',stewardPrincipal:'steward'}}
     const bundle={type:'work_bundle_proposed',eventId:'b',idempotencyKey:'b',source:'review',entityRef:'work_item:w1',payload:{workItemId:'w1',expectedRevision:1,attemptId:'a',attemptNumber:1,generation:1,runtimePrincipal:'catsco-user:559',proofMode:'catsco-message',leaseExpiresAt:'2030-01-01T00:00:00.000Z',workBundle:{contractDigest:'bundle-hash',instructions:'do work',deliverables:['PR']},taskContractHash:'task-hash',referenceSnapshotHash:'reference-hash',writeScopeHash:'scope-hash',acceptanceContractHash:'accept-hash'}}
-    expect(()=>parsePlan(JSON.stringify([registration,bundle]))).toThrow(/shared topic must be a CatsCo group/)
-    registration.payload.workerTopicId='grp_1400';registration.payload.stewardTopicId='grp_1400';registration.payload.stewardPrincipal='catsco-user:review'
-    expect(()=>parsePlan(JSON.stringify([registration,bundle]))).toThrow(/numeric CatsCo principals/)
+    expect(()=>parsePlan(JSON.stringify([registration,bundle]))).toThrow(/group Steward topic/)
   })
 })

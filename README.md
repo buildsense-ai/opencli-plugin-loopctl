@@ -31,11 +31,13 @@ The nine commands are:
 
 ## Review and Worker flow
 
-The human supplies natural language only to the Review Agent. In a multi-member group, the human must structurally mention Review; visible `@name` text is not a wake signal.
+The human supplies natural language only to the Review Agent.
 
-Review uses the current conversation as `stewardTopicId`. If the current conversation is a multi-member group, the human must structurally mention Review; visible `@name` text is not a wake signal. Review resolves the selected Worker's existing P2P topic through `opencli catsco agents`/`open`, and uses that private topic as `workerTopicId`. These topics remain distinct.
+P2P is the default: Review uses its current private topic as `stewardTopicId`, and resolves the selected Worker's existing private P2P topic through `opencli catsco agents`/`open` as `workerTopicId`. These topics remain distinct and no group or mention is needed.
 
-Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. Controller sends `execute_attempt` privately to Worker P2P. If the Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
+Fallback for multiple human supervisors: Review may explicitly use an existing multi-member `grp_*` conversation as `stewardTopicId`. In that mode, a human must structurally mention Review; visible `@name` text is not a wake signal. This changes only Review's human interaction surface; Worker dispatch remains private P2P.
+
+Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. Controller sends `execute_attempt` privately to Worker P2P. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
 
 Review inspects `review_candidate` packets with Bash, `gh`, and tests, then sends the exact output of `opencli loop review` as its CatsCo reply.
 
@@ -84,4 +86,4 @@ This plugin does not modify XiaoBa-CLI, CatsCo, Kernel transitions, protocol eve
 
 ## Residual P0 limits
 
-The integration retains these P0 limits: bounded 200-message polling; Review is co-located with `loopctl`; group membership is human/CatsCo conversation state rather than Kernel fact; Worker execution uses existing private P2P Topics; Agents must send builder output verbatim; and there is no durable `loop_completed` event. Completion is represented by no next Work Item plus a human-facing completion report.
+The integration retains these P0 limits: bounded 200-message polling; Review is co-located with `loopctl`; P2P is the default; a group is an explicit fallback human-supervision surface rather than a Worker execution queue; group membership is human/CatsCo conversation state rather than Kernel fact; Worker execution uses existing private P2P Topics; Agents must send builder output verbatim; and there is no durable `loop_completed` event. Completion is represented by no next Work Item plus a human-facing completion report.

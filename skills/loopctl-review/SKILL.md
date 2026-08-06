@@ -9,14 +9,14 @@ Humans provide requirements in natural language. Never ask them to submit Kernel
 
 Activation depends on the current CatsCo conversation:
 
-- In a P2P conversation, handle the human requirement normally.
-- In a multi-member group, begin only when the human structurally mentions this Review Agent. Visible `@name` text alone is not activation evidence.
+- In a P2P conversation, handle the human requirement normally. This is the default path and needs no mention.
+- In a multi-member group explicitly chosen for human supervision, begin only when the human structurally mentions this Review Agent. Visible `@name` text alone is not activation evidence.
 
 Before the first Work Item:
 
-1. Use the current conversation topic as `stewardTopicId`. If it is a `grp_*` topic, set the explicit numeric Review principal as `stewardPrincipal`, for example `catsco-user:574`.
-2. Resolve the selected Worker through `opencli catsco agents` or `opencli catsco open WORKER_UID`. Use the Worker's P2P topic as `workerTopicId`, for example `p2p_275_559`, and its numeric principal as `runtimePrincipal`, for example `catsco-user:559`.
-3. Keep Worker and Steward topics distinct. Do not create a group or add the Worker to the human's group for execution routing.
+1. Use the current private conversation topic as `stewardTopicId` by default. Only use an existing `grp_*` topic when multiple humans explicitly need to supervise the Loop; then set the numeric Review principal as `stewardPrincipal`, for example `catsco-user:574`.
+2. Resolve the selected Worker through `opencli catsco agents` or `opencli catsco open WORKER_UID`. Always use the Worker's private P2P topic as `workerTopicId`, for example `p2p_275_559`, and its numeric principal as `runtimePrincipal`, for example `catsco-user:559`.
+3. Keep Worker and Steward topics distinct. Do not create a group or add the Worker to a group for execution routing.
 4. Turn the requirement into the complete existing-schema plan and run `opencli loop start --plan-file FILE`.
 
 Controller sends `execute_attempt` privately to the Worker P2P topic. If the Steward topic is a group, Controller sends `review_candidate` and `plan_next` there with a structured mention for this Review Agent. Process only Actions whose `targetPrincipal` matches this Review Agent and, in a group, whose structured mention targets this Agent.

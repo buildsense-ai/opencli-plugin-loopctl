@@ -25,5 +25,11 @@ describe('strict Agent event builders', () => {
     ]
     expect(parseFanout(JSON.stringify([...pair('a','559','loop/loop-1/a','/tmp/a'),...pair('b','560','loop/loop-1/b','/tmp/b')]))).toHaveLength(4)
     expect(() => parseFanout(JSON.stringify([...pair('a','559','loop/loop-1/a','/tmp/a'),...pair('b','560','loop/loop-1/a','/tmp/b')]))).toThrow(/unique/)
+    const sharedTopicPair=(id:string, attempt:string, branch:string, path:string)=>{
+      const [registration,bundle]=pair(id,attempt,branch,path)
+      registration.payload.workerTopicId='p2p_559_602'
+      return [registration,bundle]
+    }
+    expect(() => parseFanout(JSON.stringify([...sharedTopicPair('a','559','loop/loop-1/a','/tmp/a'),...sharedTopicPair('b','560','loop/loop-1/b','/tmp/b')]))).toThrow(/worker topics/)
   })
 })

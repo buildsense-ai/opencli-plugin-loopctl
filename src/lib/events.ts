@@ -49,7 +49,7 @@ export function parseFanout(raw:string){
   const parsed=value.map(item=>planEvent.parse(item))
   const loopIds=new Set(parsed.filter(e=>e.type==='work_item_registered').map(e=>e.payload.loopId))
   if(loopIds.size!==1) throw new Error('fanout plans must share one loopId')
-  const workItems=new Set<string>(), attempts=new Set<string>(), branches=new Set<string>(), paths=new Set<string>(), leases=new Set<string>(), eventIds=new Set<string>(), idempotencyKeys=new Set<string>()
+  const workItems=new Set<string>(), attempts=new Set<string>(), branches=new Set<string>(), paths=new Set<string>(), leases=new Set<string>(), workerTopics=new Set<string>(), eventIds=new Set<string>(), idempotencyKeys=new Set<string>()
   for(let i=0;i<parsed.length;i+=2){
     const r=parsed[i], b=parsed[i+1]
     if(r.type!=='work_item_registered'||b.type!=='work_bundle_proposed') throw new Error('fanout must contain registration/bundle pairs')
@@ -68,8 +68,8 @@ export function parseFanout(raw:string){
     const normalizedPath=wt.worktreePath
     if(wt.repository!==r.payload.githubRepo) throw new Error('worktree repository must match githubRepo')
     if(!wt.branchName.startsWith(`loop/${r.payload.loopId}/`)) throw new Error('worktree branch must be scoped to loopId')
-    if(branches.has(wt.branchName)||paths.has(normalizedPath)||leases.has(wt.workspaceLease)) throw new Error('fanout worktrees and workspace leases must be unique')
-    workItems.add(r.payload.workItemId); attempts.add(b.payload.attemptId); branches.add(wt.branchName); paths.add(normalizedPath); leases.add(wt.workspaceLease)
+    if(branches.has(wt.branchName)||paths.has(normalizedPath)||leases.has(wt.workspaceLease)||workerTopics.has(r.payload.workerTopicId)) throw new Error('fanout worker topics, worktrees, and workspace leases must be unique')
+    workItems.add(r.payload.workItemId); attempts.add(b.payload.attemptId); branches.add(wt.branchName); paths.add(normalizedPath); leases.add(wt.workspaceLease); workerTopics.add(r.payload.workerTopicId)
     parsePlan(JSON.stringify([r,b]))
   }
   return parsed

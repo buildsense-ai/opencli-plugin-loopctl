@@ -13,6 +13,7 @@ opencli loop pending
 opencli loop packet ACTION_ID
 opencli loop start --plan-file plans/first.json
 opencli loop fanout --plan-file plans/parallel.json
+opencli loop agent-task-fanout --plan-file plans/parallel-agent-tasks.json
 opencli loop integrate --plan-file plans/integration.json
 opencli loop bundle --event-file plans/retry-generation-2.json
 opencli loop runtime-started --event-file events/runtime-started.json
@@ -27,7 +28,8 @@ The eleven commands are available to the explicit Loop mode:
 - `pending` — list ready Actions and current Work Items.
 - `packet ACTION_ID` — read the complete, current Agent packet.
 - `start --plan-file FILE` — ingest registration and bundle, then tick. The plan must contain exactly those two existing-schema events.
-- `fanout --plan-file FILE` — validate and ingest two or more independent registration/bundle pairs under one `loopId`, requiring unique Work Item IDs, Attempt IDs, branches, and worktree paths, then tick once to dispatch ready Actions.
+- `fanout --plan-file FILE` — validate and ingest two or more independent registration/bundle pairs under one `loopId`, requiring unique Work Item IDs, Attempt IDs, branches, and worktree paths, then tick once to dispatch ready Actions. Use it only when each Worker Topic is already isolated.
+- `agent-task-fanout --plan-file FILE` — provision and topology-verify one CatsCo `agent_task` conversation per registration before any event is ingested. Each registration must declare `workerTopicId: "agent-task:<WorkerAgentUid>"`; the command replaces it with the new `grp_<id>` topic, verifies that the group contains exactly that Agent, then registers and dispatches the whole fan-out.
 - `integrate --plan-file FILE` — require immutable Candidate/PR inputs, verify each input Work Item is accepted/closed and its Candidate exists, then register and dispatch one integration Work Item.
 - `bundle --event-file FILE` — ingest a higher-generation bundle after `changes_requested`, then tick.
 - `runtime-started`, `candidate`, and `review` — validate and canonicalize existing-schema event JSON for an Agent to send verbatim; they never ingest locally.
@@ -41,9 +43,9 @@ Loop is opt-in, not the default behavior. For an ordinary human request after au
 
 When Loop mode is explicitly active, the human supplies natural language only to the Review Agent.
 
-P2P is the default: Review uses its current private topic as `stewardTopicId`, and resolves the selected Worker's existing private P2P topic through `opencli catsco agents`/`open` as `workerTopicId`. These topics remain distinct and no group or mention is needed.
+Review uses its current private topic as `stewardTopicId` by default. A Worker P2P topic is allowed only for one non-parallel Attempt. Parallel execution uses one dedicated CatsCo `agent_task` group per Attempt: the Review User creates the group with exactly one Worker Agent, and its unique `grp_<id>` becomes that Attempt's `workerTopicId`. Controller sends a structured mention for that Worker in the dedicated group, producing one native Runtime session per Topic without Runtime changes.
 
-Fallback for multiple human supervisors: Review may explicitly use an existing multi-member `grp_*` conversation as `stewardTopicId`. In that mode, a human must structurally mention Review; visible `@name` text is not a wake signal. This changes only Review's human interaction surface; Worker dispatch remains private P2P.
+Fallback for multiple human supervisors: Review may explicitly use an existing multi-member `grp_*` conversation as `stewardTopicId`. In that mode, a human must structurally mention Review; visible `@name` text is not a wake signal. This changes only Review's human interaction surface. It must never be reused as an Attempt execution group.
 
 In explicit Loop mode, Review first runs `opencli catsco agents --format json` and selects an available Worker. If none is eligible, Review stops before creating a Work Item and asks the task author to provide a CatsCo Agent UID. Adding that Agent means establishing a friend relationship: Review uses `opencli catsco friend-request AGENT_UID --message "Loop Worker access requested"`, waits for acceptance, then refreshes `catsco agents` before proceeding. It never asks for credentials or creates a Bot as a substitute. Once an eligible Worker is available, Review creates a complete plan and runs `opencli loop start`; it does not ask the human for Kernel events. For independent parallel work, Review uses `opencli loop fanout`; each bundle carries a `LOOP_WORKTREE_CONTRACT_V1` instruction with a unique branch, worktree path, base revision, cleanup policy, and workspace lease. After all required Candidates are accepted, Review uses `opencli loop integrate`; the command fails closed unless every declared Candidate input is present behind an accepted/closed Work Item. Controller sends `execute_attempt` privately to Worker P2P. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
 

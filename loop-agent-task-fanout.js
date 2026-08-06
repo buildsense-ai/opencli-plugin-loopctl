@@ -1,4 +1,4 @@
-// loop-fanout.ts
+// loop-agent-task-fanout.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
@@ -226,8 +226,73 @@ var unwrap = (value) => {
 };
 
 // src/lib/catsco.ts
+import { spawn as spawn2 } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
+var TIMEOUT_MS = 3e4;
+function unwrap2(value) {
+  if (value && typeof value === "object" && "data" in value) return value.data;
+  return value;
+}
+async function createAgentTaskTopic(name, workerAgentUid) {
+  if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError2("agent-task Worker UID must be numeric");
+  if (!name || name.length > 180) throw new CommandExecutionError2("agent-task name is invalid");
+  const value = await new Promise((resolve2, reject) => {
+    const child = spawn2(process.env.OPENCLI_BINARY?.trim() || "opencli", [
+      "catsco",
+      "group-create",
+      name,
+      workerAgentUid,
+      "--kind",
+      "agent_task",
+      "--format",
+      "json"
+    ], { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      child.kill("SIGKILL");
+    }, TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (Buffer.byteLength(stdout) > MAX_OUTPUT2) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk).slice(0, 4096);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new CommandExecutionError2(`CatsCo agent-task provisioning unavailable: ${error.message}`));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return reject(new CommandExecutionError2("CatsCo agent-task provisioning timed out or produced too much output"));
+      if (code !== 0) return reject(new CommandExecutionError2(`CatsCo agent-task provisioning failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
+      try {
+        resolve2(JSON.parse(stdout));
+      } catch {
+        reject(new CommandExecutionError2("CatsCo agent-task provisioning returned invalid JSON"));
+      }
+    });
+  });
+  const row2 = unwrap2(value);
+  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo agent-task provisioning returned a non-object");
+  const record = row2;
+  const groupId = String(record.groupId ?? record.group_id ?? "");
+  const topic = String(record.topic ?? "");
+  const kind = String(record.kind ?? "");
+  const agentIds = String(record.agentIds ?? record.agent_ids ?? "");
+  const actualIds = agentIds.split(",").map((value2) => value2.trim()).filter(Boolean);
+  if (!/^[1-9]\d*$/.test(groupId) || !/^grp_[1-9]\d*$/.test(topic) || kind !== "agent_task" || actualIds.length !== 1 || actualIds[0] !== workerAgentUid) {
+    throw new CommandExecutionError2("CatsCo agent-task provisioning response failed topology verification");
+  }
+  return { groupId, topic, kind: "agent_task", agentIds };
+}
 
 // src/lib/commands.ts
 var parseResponse = (schema, value, label) => {
@@ -249,17 +314,43 @@ async function ingest(event) {
 async function tick() {
   return parseResponse(tickSchema, unwrap(await runLoopctl(["tick"])), "tick");
 }
-async function fanout(kwargs) {
+async function agentTaskFanout(kwargs) {
   let events;
   try {
     events = parseFanout(await readConfinedFile(String(kwargs["plan-file"])));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid fanout file");
+    throw new ArgumentError(error instanceof Error ? error.message : "invalid agent-task fanout file");
   }
+  const provisionedTopics = [];
+  const rewritten = [];
+  for (let index = 0; index < events.length; index += 2) {
+    const registration = events[index];
+    const bundleEvent = events[index + 1];
+    const placeholder = /^agent-task:([1-9]\d*)$/.exec(registration.payload.workerTopicId);
+    if (!placeholder) throw new ArgumentError(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${registration.payload.workItemId}`);
+    const workerAgentUid = placeholder[1];
+    if (bundleEvent.payload.runtimePrincipal !== `catsco-user:${workerAgentUid}`) throw new ArgumentError(`agent-task runtime principal does not match Worker UID for ${registration.payload.workItemId}`);
+    const group = await createAgentTaskTopic(`Loop ${registration.payload.loopId} ${bundleEvent.payload.attemptId}`, workerAgentUid);
+    const allocated = { ...registration, payload: { ...registration.payload, workerTopicId: group.topic } };
+    rewritten.push(allocated, bundleEvent);
+    provisionedTopics.push({ workItemId: registration.payload.workItemId, attemptId: bundleEvent.payload.attemptId, topic: group.topic, groupId: group.groupId });
+  }
+  parseFanout(JSON.stringify(rewritten));
   const receipts = [];
-  for (const event of events) receipts.push(await ingest(event));
-  return { count: events.length / 2, receipts, tick: await tick() };
+  for (const event of rewritten) receipts.push(await ingest(event));
+  return { count: rewritten.length / 2, provisionedTopics, receipts, tick: await tick() };
 }
 
-// loop-fanout.ts
-cli({ site: "loop", name: "fanout", description: "Review-only: register and dispatch multiple independent Work Item plans", access: "write", browser: false, strategy: Strategy.LOCAL, args: [{ name: "plan-file", help: "Fan-out JSON file containing registration/bundle pairs", required: true }], columns: ["count", "receipts", "tick"], defaultFormat: "json", func: fanout });
+// loop-agent-task-fanout.ts
+cli({
+  site: "loop",
+  name: "agent-task-fanout",
+  description: "Review-only: provision one CatsCo agent_task conversation per Attempt, then register and dispatch the fan-out",
+  access: "write",
+  browser: false,
+  strategy: Strategy.LOCAL,
+  args: [{ name: "plan-file", help: "Fan-out JSON with workerTopicId agent-task:<WorkerAgentUid> placeholders", required: true }],
+  columns: ["count", "provisionedTopics", "receipts", "tick"],
+  defaultFormat: "json",
+  func: agentTaskFanout
+});

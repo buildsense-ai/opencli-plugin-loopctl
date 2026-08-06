@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -113,6 +113,10 @@ async function readConfinedFile(file) {
     await handle.close();
   }
 }
+
+// src/lib/catsco.ts
+import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
+var MAX_OUTPUT2 = 128 * 1024;
 
 // src/lib/commands.ts
 var readEvent = async (file, schema) => {

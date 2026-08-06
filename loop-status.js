@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -132,12 +132,16 @@ var unwrap = (value) => {
   return value;
 };
 
+// src/lib/catsco.ts
+import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
+var MAX_OUTPUT2 = 128 * 1024;
+
 // src/lib/commands.ts
 var parseResponse = (schema, value, label) => {
   try {
     return schema.parse(value);
   } catch {
-    throw new CommandExecutionError2(`loopctl returned malformed ${label} JSON`);
+    throw new CommandExecutionError3(`loopctl returned malformed ${label} JSON`);
   }
 };
 async function status(kwargs) {

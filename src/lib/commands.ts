@@ -2,7 +2,7 @@ import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
 import { bundle, candidate, parseAgentTaskFanout, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
-import { createAgentTaskTopic } from './catsco.js'
+import { attachTopicToProject, createAgentTaskTopic } from './catsco.js'
 
 const asObject=(value:unknown):Record<string,unknown>=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new CommandExecutionError('loopctl returned a non-object JSON value');return value as Record<string,unknown>}
 const parseResponse=<T>(schema:{parse(value:unknown):T},value:unknown,label:string):T=>{try{return schema.parse(value)}catch{throw new CommandExecutionError(`loopctl returned malformed ${label} JSON`)}}
@@ -25,7 +25,7 @@ export async function fanout(kwargs:any){
 export async function agentTaskFanout(kwargs:any){
   let events: any[]
   try { events=parseAgentTaskFanout(await readConfinedFile(String(kwargs['plan-file']))) } catch(error) { throw new ArgumentError(error instanceof Error?error.message:'invalid agent-task fanout file') }
-  const provisionedTopics: Array<{ workItemId: string; attemptId: string; topic: string; groupId: string }> = []
+  const provisionedTopics: Array<{ workItemId: string; attemptId: string; topic: string; groupId: string; projectId: string }> = []
   const rewritten: any[] = []
   for(let index=0; index<events.length; index+=2) {
     const registration=events[index]
@@ -33,11 +33,14 @@ export async function agentTaskFanout(kwargs:any){
     const placeholder=/^agent-task:([1-9]\d*)$/.exec(registration.payload.workerTopicId)
     if(!placeholder) throw new ArgumentError(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${registration.payload.workItemId}`)
     const workerAgentUid=placeholder[1]
+    const projectId=String(registration.payload.catscoProjectId)
+    if(!/^[1-9]\d*$/.test(projectId)) throw new ArgumentError(`agent-task fanout requires a numeric catscoProjectId for ${registration.payload.workItemId}`)
     if(bundleEvent.payload.runtimePrincipal !== `catsco-user:${workerAgentUid}`) throw new ArgumentError(`agent-task runtime principal does not match Worker UID for ${registration.payload.workItemId}`)
     const group=await createAgentTaskTopic(`Loop ${registration.payload.loopId} ${bundleEvent.payload.attemptId}`, workerAgentUid)
+    await attachTopicToProject(projectId, group.topic)
     const allocated={...registration,payload:{...registration.payload,workerTopicId:group.topic}}
     rewritten.push(allocated,bundleEvent)
-    provisionedTopics.push({workItemId:registration.payload.workItemId,attemptId:bundleEvent.payload.attemptId,topic:group.topic,groupId:group.groupId})
+    provisionedTopics.push({workItemId:registration.payload.workItemId,attemptId:bundleEvent.payload.attemptId,topic:group.topic,groupId:group.groupId,projectId})
   }
   parseFanout(JSON.stringify(rewritten))
   const receipts=[]

@@ -53,6 +53,21 @@ export async function createAgentTaskTopic(name: string, workerAgentUid: string)
   return { groupId, topic, kind: 'agent_task', agentIds }
 }
 
+export async function resolveLoopProject(loopId: string, requestedProjectId: string): Promise<string> {
+  if (/^[1-9]\d*$/.test(requestedProjectId)) return requestedProjectId
+  if (requestedProjectId !== 'project:auto') throw new CommandExecutionError('catscoProjectId must be numeric or project:auto')
+  const name = `Loop ${loopId}`
+  const listed = unwrap(await runOpenCli(['catsco', 'projects', '--format', 'json']))
+  if (!Array.isArray(listed)) throw new CommandExecutionError('CatsCo Projects returned invalid JSON')
+  const existing = listed.find(row => row && typeof row === 'object' && String((row as Record<string, unknown>).name ?? '') === name) as Record<string, unknown> | undefined
+  if (existing && /^[1-9]\d*$/.test(String(existing.id ?? ''))) return String(existing.id)
+  const created = unwrap(await runOpenCli(['catsco', 'project-create', name, '--format', 'json']))
+  if (!created || typeof created !== 'object' || !/^[1-9]\d*$/.test(String((created as Record<string, unknown>).id ?? ''))) {
+    throw new CommandExecutionError('CatsCo Project allocation returned an invalid Project id')
+  }
+  return String((created as Record<string, unknown>).id)
+}
+
 export async function attachTopicToProject(projectId: string, topic: string): Promise<void> {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError('CatsCo Project id must be numeric')
   await runOpenCli(['catsco', 'project-assign-topic', projectId, topic, '--format', 'json'])

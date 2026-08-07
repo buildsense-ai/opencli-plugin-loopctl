@@ -1,8 +1,8 @@
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
-import { bundle, candidate, parseAgentTaskFanout, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
+import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, runtimeStarted } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
-import { attachTopicToProject, createAgentTaskTopic, resolveLoopProject } from './catsco.js'
+import { attachTopicToProject, createAgentTaskTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
 
 const asObject=(value:unknown):Record<string,unknown>=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new CommandExecutionError('loopctl returned a non-object JSON value');return value as Record<string,unknown>}
 const parseResponse=<T>(schema:{parse(value:unknown):T},value:unknown,label:string):T=>{try{return schema.parse(value)}catch{throw new CommandExecutionError(`loopctl returned malformed ${label} JSON`)}}
@@ -73,8 +73,15 @@ export async function integrate(kwargs:any){
   return {inputCount:plan.inputs.length,receipts,tick:await tick()}
 }
 export async function bundleCommand(kwargs:any){const event=await readEvent(String(kwargs['event-file']),bundle);return {receipt:await ingest(event),tick:await tick()}}
-import { canonicalJson } from './events.js'
 export async function builder(kwargs:any,schema:any){const event=await readEvent(String(kwargs['event-file']),schema);return JSON.parse(canonicalJson(event))}
+export async function candidateSubmit(kwargs:any){
+  let submission: ReturnType<typeof candidateSubmission.parse>
+  try { submission=candidateSubmission.parse(JSON.parse(await readConfinedFile(String(kwargs['event-file'])))) }
+  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid Candidate submission file') }
+  const content=canonicalJson(submission.event)
+  const receipt=await sendAttemptEvent(submission.targetTopicId, content, submission.event.idempotencyKey)
+  return {targetTopicId:submission.targetTopicId,event:JSON.parse(content),receipt}
+}
 export async function next(kwargs:any){
   const actionId=String(kwargs['plan-next-action-id']??'')
   if(!actionId) throw new ArgumentError('next requires --plan-next-action-id')

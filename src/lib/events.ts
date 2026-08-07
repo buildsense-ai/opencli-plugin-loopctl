@@ -11,7 +11,16 @@ export const worktreeContractSchema=worktreeContract
 const bundlePayload=z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,attemptNumber:z.number().int().positive(),generation:z.number().int().nonnegative(),runtimePrincipal:id,proofMode:z.enum(['ed25519','catsco-message']).optional(),proofKeyId:id.optional(),proofPublicKey:id.optional(),leaseExpiresAt:z.string().datetime(),workBundle:z.object({contractDigest:hash,instructions:id,deliverables:z.array(id)}).strict(),...contracts}).strict()
 export const bundle=z.object({...base,type:z.literal('work_bundle_proposed'),payload:bundlePayload}).strict()
 export const runtimeStarted=z.object({...base,type:z.literal('runtime_started'),payload:z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,signature:z.literal('catsco-message-attested')}).strict()}).strict()
-export const candidate=z.object({...base,type:z.literal('candidate_submitted'),payload:z.object({ownerUid:id,workItemId:id,workItemRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,candidateId:id,deliverable,...contracts,proofMode:z.enum(['ed25519','catsco-message']).optional(),signature:id.optional()}).strict()}).strict()
+export const candidate=z.object({...base,type:z.literal('candidate_submitted'),payload:z.object({ownerUid:id,workItemId:id,workItemRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,candidateId:id,deliverable,...contracts,proofMode:z.enum(['ed25519','catsco-message']).optional(),signature:id.optional()}).strict()}).strict().superRefine((event,context)=>{
+  if((event.payload.proofMode??'ed25519')==='catsco-message'&&!/^catsco-user:[1-9]\d*$/.test(event.payload.runtimePrincipal)) context.addIssue({code:'custom',path:['payload','runtimePrincipal'],message:'CatsCo-message Candidate requires a numeric CatsCo runtime principal'})
+})
+const attemptTopicId=z.string().regex(/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/, 'targetTopicId must be a CatsCo Attempt topic')
+/** Worker-local submission envelope. targetTopicId is transport metadata and is never sent as part of the event. */
+export const candidateSubmission=z.object({targetTopicId:attemptTopicId,event:candidate}).strict().superRefine((submission, context)=>{
+  const payload=submission.event.payload
+  if(submission.event.entityRef!==`attempt:${payload.attemptId}`) context.addIssue({code:'custom',path:['event','entityRef'],message:'Candidate entityRef must bind its attemptId'})
+  if(submission.event.source!==payload.runtimePrincipal) context.addIssue({code:'custom',path:['event','source'],message:'Candidate source must match runtimePrincipal'})
+})
 export const review=z.object({...base,type:z.literal('review_decided'),payload:z.object({workItemId:id,expectedRevision:z.number().int().positive(),candidateId:id,outcome:z.enum(['accepted','changes_requested']),reviewerPrincipal:id,authenticationRef:id.optional(),reviewerProof:id.optional(),reviewedHeadSha:id,reviewedDeliverableDigest:hash,acceptanceContractHash:hash}).strict()}).strict()
 export const planEvent=z.union([registered,bundle])
 export type LoopEvent= z.infer<typeof registered>|z.infer<typeof bundle>|z.infer<typeof runtimeStarted>|z.infer<typeof candidate>|z.infer<typeof review>

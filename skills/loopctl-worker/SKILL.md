@@ -13,7 +13,7 @@ The Controller is the sole scheduler. Do not use `sleep`, `opencli catsco messag
 2. Before touching the repository, extract the single `LOOP_WORKTREE_CONTRACT_V1=` JSON line from `workBundle.instructions`. Fail closed if it is missing, duplicated, malformed, or conflicts with the packet repository. Verify the base revision, branch name, normalized absolute worktree path, and workspace lease. Create or enter the specified isolated worktree with Bash/Git; never execute two Attempts in the same worktree. Separate Attempts for the same Agent are allowed only with distinct worktrees and workspace leases.
 3. Build `runtime_started` using `opencli loop runtime-started --event-file FILE` and send its exact canonical JSON first as the current P2P CatsCo reply.
 4. Use Bash/Git/`gh` for bounded implementation and verification. Keep the branch scoped to the packet's Work Item and generation.
-5. Build `candidate_submitted` with `opencli loop candidate --event-file FILE`, then send that exact canonical JSON as the same P2P CatsCo reply.
+5. Write a relative Candidate submission file containing exactly `{ "targetTopicId": "<packet targetTopicId>", "event": <candidate_submitted event> }`, then run `opencli loop candidate-submit --event-file FILE`. Completion requires its server-confirmed CatsCo receipt; do not manually send Candidate JSON or claim completion if the command fails.
 
 Do not join or use the human/Review group for work dispatch. Do not add mention, sender, or topic fields to event JSON; the trusted CatsCo P2P envelope supplies identity and topic attestation.
 

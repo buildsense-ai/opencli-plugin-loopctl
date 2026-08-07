@@ -16,6 +16,43 @@ export interface AgentTaskTopic {
   agentIds: string
 }
 
+export interface CatscoSendReceipt {
+  messageId: string
+  topicId: string
+  clientMsgId: string
+  seqId: string
+  duplicate: boolean
+  contentDigest: string
+}
+
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  const row = unwrap(value)
+  if (!row || typeof row !== 'object' || Array.isArray(row)) throw new CommandExecutionError(`CatsCo ${label} returned a non-object`)
+  return row as Record<string, unknown>
+}
+
+export async function sendAttemptEvent(topicId: string, content: string, clientMsgId: string): Promise<CatscoSendReceipt> {
+  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError('Candidate targetTopicId must be a CatsCo Attempt topic')
+  if (!clientMsgId.trim()) throw new CommandExecutionError('Candidate idempotencyKey is required')
+  const sent = asRecord(await runOpenCli(['catsco', 'send', topicId, content, '--client-message-id', clientMsgId, '--format', 'json']), 'Candidate send')
+  const receipt = {
+    messageId: String(sent.messageId ?? ''),
+    topicId: String(sent.topicId ?? ''),
+    clientMsgId: String(sent.clientMsgId ?? ''),
+    seqId: String(sent.seqId ?? ''),
+    duplicate: sent.duplicate === true,
+    contentDigest: String(sent.contentDigest ?? '')
+  }
+  if (!receipt.messageId || !receipt.seqId || receipt.topicId !== topicId || receipt.clientMsgId !== clientMsgId || !receipt.contentDigest) {
+    throw new CommandExecutionError('CatsCo Candidate send receipt failed verification')
+  }
+  const confirmed = asRecord(await runOpenCli(['catsco', 'message-receipt', topicId, '--client-message-id', clientMsgId, '--format', 'json']), 'Candidate receipt')
+  if (confirmed.found !== true || confirmed.serverConfirmed !== true || String(confirmed.topicId ?? '') !== topicId || String(confirmed.clientMsgId ?? '') !== clientMsgId || String(confirmed.seqId ?? '') !== receipt.seqId || String(confirmed.contentDigest ?? '') !== receipt.contentDigest) {
+    throw new CommandExecutionError('CatsCo Candidate receipt was not server-confirmed')
+  }
+  return receipt
+}
+
 async function runOpenCli(args: string[]): Promise<unknown> {
   return await new Promise((resolve, reject) => {
     const child = spawn(process.env.OPENCLI_BINARY?.trim() || 'opencli', args, { shell: false, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })

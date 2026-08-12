@@ -93,10 +93,15 @@ export async function agentTaskStart(kwargs:any){
 
     const registrationEvent={...parsed.registration,payload:{...parsed.registration.payload,
       catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,
-      stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`}}
+      stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`,
+      coordinatorSessionId:parsed.registration.payload.coordinatorSessionId,
+      coordinatorSessionTopicId:parsed.registration.payload.coordinatorSessionTopicId}}
     const routedBundle={...parsed.bundle,payload:{...parsed.bundle.payload,attemptRoute:{
       catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,
-      stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`
+      stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`,
+      workerSessionId:`session:v2:catscompany:group:${workerTopic.topic}:agent:${parsed.workerAgentUid}`,
+      coordinatorSessionId:parsed.registration.payload.coordinatorSessionId!,
+      coordinatorSessionTopicId:parsed.registration.payload.coordinatorSessionTopicId!
     }}}
     const events=[registrationEvent,routedBundle]
     parsePlan(JSON.stringify(events))
@@ -178,7 +183,10 @@ export async function agentTaskRetry(kwargs:any){
     await attachTopicToProject(projectId,evidenceTopic.topic)
     await attachTopicToProject(projectId,reviewTopic.topic)
     journal=await journalStore.save({phase:'topics_attached',projectId,workerTopic,evidenceTopic,reviewTopic})
-    const rewritten={...retry,payload:{...p,attemptRoute:{catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,stewardTopicId:reviewTopic.topic,stewardPrincipal:recoveryPacket.stewardPrincipal}}}
+    const coordinatorSessionId=String(recoveryPacket.coordinatorSessionId ?? '')
+    const coordinatorSessionTopicId=String(recoveryPacket.coordinatorSessionTopicId ?? '')
+    if(!coordinatorSessionId||!coordinatorSessionTopicId) throw new ArgumentError('recover_attempt lacks the originating coordinator session route')
+    const rewritten={...retry,payload:{...p,attemptRoute:{catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,stewardTopicId:reviewTopic.topic,stewardPrincipal:recoveryPacket.stewardPrincipal,workerSessionId:`session:v2:catscompany:group:${workerTopic.topic}:agent:${worker[1]}`,coordinatorSessionId,coordinatorSessionTopicId}}}
     const bundleReceipt=journal.bundleReceipt ?? await ingest(rewritten)
     if(!journal.bundleReceipt) journal=await journalStore.save({phase:'bundle_ingested',bundleReceipt})
     const tickReceipt=journal.tick ?? await tick()

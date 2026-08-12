@@ -18,7 +18,7 @@ function plan() {
   return [
     { type: 'work_item_registered', eventId: 'register-1', idempotencyKey: 'register-1', source: 'catsco-user:602', entityRef: 'work_item:wi-1', payload: {
       workItemId: 'wi-1', loopId: 'loop-1', profileId: 'product@1', terminalState: 'accepted', ...hashes, writeScope: ['src/**'], githubRepo: 'acme/repo',
-      catscoProjectId: 'project:auto', workerTopicId: 'agent-task:559', evidenceTopicId: 'evidence-topic:559:574', stewardTopicId: 'review-topic:574', stewardPrincipal: 'catsco-user:574'
+      catscoProjectId: 'project:auto', workerTopicId: 'agent-task:559', evidenceTopicId: 'evidence-topic:559:574', stewardTopicId: 'review-topic:574', stewardPrincipal: 'catsco-user:574', coordinatorSessionId: 'session:v2:catscompany:p2p:p2p_574_602:agent:574', coordinatorSessionTopicId: 'p2p_574_602'
     } },
     { type: 'work_bundle_proposed', eventId: 'bundle-1', idempotencyKey: 'bundle-1', source: 'catsco-user:602', entityRef: 'work_item:wi-1', payload: {
       workItemId: 'wi-1', expectedRevision: 1, attemptId: 'attempt-1', attemptNumber: 1, generation: 1, runtimePrincipal: 'catsco-user:559', proofMode: 'catsco-message', leaseExpiresAt: '2030-01-01T00:00:00.000Z',
@@ -34,7 +34,7 @@ function recoveryPacket() {
     kind: 'recover_attempt', schema: 'loopctl-action-packet-v1', actionId: 'action-recover-1', actionKey: 'recover-attempt-1', workItemId: 'wi-1', workItemRevision: 4,
     targetPrincipal: 'catsco-user:574', targetTopicId: 'grp_103', targetDigest: 'target-digest', packetDigest: 'packet-digest',
     action: { id: 'action-recover-1', key: 'recover-attempt-1', kind: 'recover_attempt', state: 'ready', workItemRevision: 4, targetPrincipal: 'catsco-user:574', targetTopicId: 'grp_103', targetDigest: 'target-digest' },
-    contracts, loopId: 'loop-1', profileId: 'product@1', githubRepo: 'acme/repo', catscoProjectId: '41', workerTopicId: 'grp_101', evidenceTopicId: 'grp_102', stewardPrincipal: 'catsco-user:574', stewardTopicId: 'grp_103',
+    contracts, loopId: 'loop-1', profileId: 'product@1', githubRepo: 'acme/repo', catscoProjectId: '41', workerTopicId: 'grp_101', evidenceTopicId: 'grp_102', stewardPrincipal: 'catsco-user:574', stewardTopicId: 'grp_103', coordinatorSessionId: 'session:v2:catscompany:p2p:p2p_574_602:agent:574', coordinatorSessionTopicId: 'p2p_574_602',
     previousAttempt: { attemptId: 'attempt-1', attemptNumber: 1, generation: 1, controlState: 'superseded', reportedState: 'runtime_start_timeout', leaseExpiresAt: '2030-01-01T00:00:00.000Z', runtimePrincipal: 'catsco-user:559', workBundle: { contractDigest: 'old-bundle', instructions: `LOOP_WORKTREE_CONTRACT_V1=${JSON.stringify(worktree)}` } },
     recovery: { requireFreshWorkerTopic: true, requireFreshEvidenceTopic: true, requireFreshStewardTopic: true, requireFreshWorktree: true, requireFreshWorkspaceLease: true }
   }

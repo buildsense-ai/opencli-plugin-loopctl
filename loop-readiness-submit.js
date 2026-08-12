@@ -1,4 +1,4 @@
-// loop-next.ts
+// loop-readiness-submit.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
@@ -101,37 +101,13 @@ var reviewSubmission = z2.object({ targetTopicId: attemptTopicId, event: review 
   if (submission.event.source !== payload.reviewerPrincipal) context.addIssue({ code: "custom", path: ["event", "source"], message: "Review source must match reviewerPrincipal" });
 });
 var planEvent = z2.union([registered, bundle]);
-var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
-function parsePlan(raw) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("plan file is not valid JSON");
-  }
-  if (!Array.isArray(value) || value.length !== 2) throw new Error("plan file must be an array of exactly two events");
-  const parsed = value.map((item) => planEvent.parse(item));
-  const registration = parsed[0], proposed = parsed[1];
-  if (registration.type !== "work_item_registered" || proposed.type !== "work_bundle_proposed") throw new Error("plan must contain work_item_registered followed by work_bundle_proposed");
-  const r = registration.payload, b = proposed.payload;
-  if (r.workItemId !== b.workItemId) throw new Error("plan Work Item IDs must match");
-  if (b.expectedRevision !== 1) throw new Error("new plan bundle expectedRevision must be 1");
-  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (r[key] !== b[key]) throw new Error(`plan contract mismatch: ${key}`);
-  if (!r.workerTopicId || !r.stewardTopicId || r.workerTopicId === r.stewardTopicId) throw new Error("plan requires distinct worker and steward topics");
-  if (r.evidenceTopicId !== void 0) {
-    if (!/^grp_[1-9]\d*$/.test(r.evidenceTopicId)) throw new Error("evidenceTopicId must be a CatsCo group topic");
-    if ((/* @__PURE__ */ new Set([r.workerTopicId, r.evidenceTopicId, r.stewardTopicId])).size !== 3) throw new Error("plan requires distinct worker, evidence, and steward topics");
-  }
-  const numericCatscoPrincipal = /^catsco-user:[1-9]\d*$/;
-  if (r.stewardTopicId.startsWith("grp_") && (!r.stewardPrincipal || !numericCatscoPrincipal.test(r.stewardPrincipal))) throw new Error("group Steward topic requires a numeric CatsCo principal");
-  if (r.stewardPrincipal !== void 0 && !r.stewardPrincipal.startsWith("catsco-user:")) throw new Error("plan stewardPrincipal must be a CatsCo principal");
-  if ((b.proofMode ?? "ed25519") === "catsco-message" && !b.runtimePrincipal.startsWith("catsco-user:")) throw new Error("CatsCo-message bundle requires a CatsCo runtime principal");
-  if (b.proofMode === "ed25519" && (!b.proofKeyId || !b.proofPublicKey)) throw new Error("Ed25519 bundle requires proof key fields");
-  return parsed;
+var canonical = (value) => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value;
+function canonicalJson(value) {
+  return JSON.stringify(canonical(value));
 }
+var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 
 // src/lib/loopctl.ts
-import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { realpath, lstat, open } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -139,50 +115,7 @@ import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
 var MAX_INPUT = 512 * 1024;
-var timeoutMs = 3e4;
 var jsonValue = z3.unknown();
-function binary() {
-  return process.env.LOOPCTL_BINARY?.trim() || "loopctl";
-}
-async function runLoopctl(args, input) {
-  if (args.length > 8 || args.some((arg) => arg.length > 4096 || arg.includes("\0"))) {
-    throw new CommandExecutionError("invalid loopctl arguments");
-  }
-  if (input && Buffer.byteLength(input) > MAX_INPUT) throw new CommandExecutionError("loopctl input is too large");
-  return await new Promise((resolveResult, reject) => {
-    const child = spawn(binary(), args, { shell: false, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "", stderr = "", killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT) {
-        killed = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk).slice(0, 4096);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(new CommandExecutionError(`loopctl unavailable: ${error.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) return reject(new CommandExecutionError("loopctl timed out or produced too much output"));
-      if (code !== 0) return reject(new CommandExecutionError(`loopctl failed (exit ${code ?? 1})`));
-      try {
-        resolveResult(JSON.parse(stdout));
-      } catch {
-        reject(new CommandExecutionError("loopctl returned invalid JSON"));
-      }
-    });
-    child.stdin.end(input ?? "");
-  });
-}
 async function readConfinedFile(file) {
   if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
   const cwd = resolve(process.cwd());
@@ -203,14 +136,88 @@ async function readConfinedFile(file) {
     await handle.close();
   }
 }
-var unwrap = (value) => {
-  if (value && typeof value === "object" && "data" in value) return value.data;
-  return value;
-};
 
 // src/lib/catsco.ts
+import { spawn } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
+var TIMEOUT_MS = 3e4;
+function unwrap(value) {
+  if (value && typeof value === "object" && "data" in value) return value.data;
+  return value;
+}
+function asRecord(value, label) {
+  const row2 = unwrap(value);
+  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2(`CatsCo ${label} returned a non-object`);
+  return row2;
+}
+async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal) {
+  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError2("attested event targetTopicId must be a CatsCo Attempt topic");
+  if (!clientMsgId.trim()) throw new CommandExecutionError2("attested event idempotencyKey is required");
+  const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1];
+  if (!expectedUid) throw new CommandExecutionError2("attested event source must be a numeric CatsCo principal");
+  const authenticatedUid = await currentCatscoUid();
+  if (authenticatedUid !== expectedUid) throw new CommandExecutionError2("CatsCo authenticated sender does not match attested event source");
+  const sent = asRecord(await runOpenCli(["catsco", "send", topicId, content, "--client-message-id", clientMsgId, "--format", "json"]), "attested event send");
+  const receipt = {
+    messageId: String(sent.messageId ?? ""),
+    topicId: String(sent.topicId ?? ""),
+    clientMsgId: String(sent.clientMsgId ?? ""),
+    seqId: String(sent.seqId ?? ""),
+    duplicate: sent.duplicate === true,
+    contentDigest: String(sent.contentDigest ?? "")
+  };
+  if (!receipt.messageId || !receipt.seqId || receipt.topicId !== topicId || receipt.clientMsgId !== clientMsgId || !receipt.contentDigest) {
+    throw new CommandExecutionError2("CatsCo attested event send receipt failed verification");
+  }
+  const confirmed = asRecord(await runOpenCli(["catsco", "message-receipt", topicId, "--client-message-id", clientMsgId, "--format", "json"]), "attested event receipt");
+  if (confirmed.found !== true || confirmed.serverConfirmed !== true || String(confirmed.topicId ?? "") !== topicId || String(confirmed.clientMsgId ?? "") !== clientMsgId || String(confirmed.seqId ?? "") !== receipt.seqId || String(confirmed.contentDigest ?? "") !== receipt.contentDigest) {
+    throw new CommandExecutionError2("CatsCo attested event receipt was not server-confirmed");
+  }
+  return receipt;
+}
+async function runOpenCli(args) {
+  return await new Promise((resolve2, reject) => {
+    const child = spawn(process.env.OPENCLI_BINARY?.trim() || "opencli", args, { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      child.kill("SIGKILL");
+    }, TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (Buffer.byteLength(stdout) > MAX_OUTPUT2) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk).slice(0, 4096);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new CommandExecutionError2(`CatsCo provisioning unavailable: ${error.message}`));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killed) return reject(new CommandExecutionError2("CatsCo provisioning timed out or produced too much output"));
+      if (code !== 0) return reject(new CommandExecutionError2(`CatsCo provisioning failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
+      try {
+        resolve2(JSON.parse(stdout));
+      } catch {
+        reject(new CommandExecutionError2("CatsCo provisioning returned invalid JSON"));
+      }
+    });
+  });
+}
+async function currentCatscoUid() {
+  const row2 = asRecord(await runOpenCli(["catsco", "me", "--format", "json"]), "identity");
+  const uid = String(row2.uid ?? "");
+  if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
+  return uid;
+}
 
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
@@ -228,46 +235,32 @@ var packetSchema = z4.object({
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/commands.ts
-var parseResponse = (schema, value, label) => {
+async function submitAttestedEvent(file, schema, label) {
+  let submission;
   try {
-    return schema.parse(value);
-  } catch {
-    throw new CommandExecutionError4(`loopctl returned malformed ${label} JSON`);
-  }
-};
-var assertAcceptedReceipt = (value) => {
-  const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
-  return receipt;
-};
-async function ingest(event) {
-  return assertAcceptedReceipt(unwrap(await runLoopctl(["ingest", "--file", "-"], `${JSON.stringify(event)}
-`)));
-}
-async function tick() {
-  return parseResponse(tickSchema, unwrap(await runLoopctl(["tick"])), "tick");
-}
-var readPlan = async (file) => {
-  try {
-    return parsePlan(await readConfinedFile(file));
+    submission = schema.parse(JSON.parse(await readConfinedFile(file)));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid plan file");
+    throw new ArgumentError(error instanceof Error ? error.message : `invalid ${label} submission file`);
   }
-};
-async function next(kwargs) {
-  const actionId = String(kwargs["plan-next-action-id"] ?? "");
-  if (!actionId) throw new ArgumentError("next requires --plan-next-action-id");
-  const packet = parseResponse(actionPacketSchema, unwrap(await runLoopctl(["packet", "--action-id", actionId])), "packet");
-  if (packet.kind !== "plan_next" || !["accepted", "closed"].includes(packet.completedWorkItem.state) || !["ready", "satisfied"].includes(packet.action.state)) throw new ArgumentError("plan_next action is stale or not current");
-  const events = await readPlan(String(kwargs["plan-file"]));
-  const registration = events[0];
-  if (registration.payload.loopId !== packet.loopId) throw new ArgumentError("next plan loopId does not match plan_next packet");
-  if (registration.payload.workItemId === packet.completedWorkItem.workItemId) throw new ArgumentError("next plan must use a new Work Item ID");
-  const receipts = [];
-  receipts.push(await ingest(events[0]));
-  receipts.push(await ingest(events[1]));
-  return { planNextPacket: packet, receipts, tick: await tick() };
+  const content = canonicalJson(submission.event);
+  const event = JSON.parse(content);
+  const receipt = await sendAttemptEvent(submission.targetTopicId, content, submission.event.idempotencyKey, event.source);
+  return { targetTopicId: submission.targetTopicId, event: JSON.parse(content), receipt };
+}
+async function readinessSubmit(kwargs) {
+  return submitAttestedEvent(String(kwargs["event-file"]), workerReadySubmission, "worker_ready");
 }
 
-// loop-next.ts
-cli({ site: "loop", name: "next", description: "Review-only: start the next Work Item in a loop", access: "write", browser: false, strategy: Strategy.LOCAL, args: [{ name: "plan-next-action-id", help: "Current plan_next action id", required: true }, { name: "plan-file", help: "Plan JSON file", required: true }], columns: ["planNextPacket", "receipts", "tick"], defaultFormat: "json", func: next });
+// loop-readiness-submit.ts
+cli({
+  site: "loop",
+  name: "readiness-submit",
+  description: "Worker-only: submit receipt-attested worker_ready JSON before an Attempt starts",
+  access: "write",
+  browser: false,
+  strategy: Strategy.LOCAL,
+  args: [{ name: "event-file", help: "Relative worker_ready submission JSON file", required: true }],
+  columns: ["targetTopicId", "event", "receipt"],
+  defaultFormat: "json",
+  func: readinessSubmit
+});

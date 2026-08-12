@@ -1,4 +1,4 @@
-// loop-next.ts
+// loop-workspace-prepare.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
@@ -70,6 +70,7 @@ var contracts = { taskContractHash: hash2, referenceSnapshotHash: hash2, writeSc
 var deliverable = z2.object({ kind: z2.literal("github_pr"), repository: id2, prNumber: z2.number().int().positive(), headSha: id2, baseSha: id2, digest: hash2 }).strict();
 var registered = z2.object({ ...base, type: z2.literal("work_item_registered"), payload: z2.object({ workItemId: id2, loopId: id2, profileId: id2, terminalState: z2.enum(["accepted", "closed"]), ...contracts, writeScope: z2.array(id2), githubRepo: id2, catscoProjectId: id2, workerTopicId: id2, evidenceTopicId: id2.optional(), stewardTopicId: id2, stewardPrincipal: id2.optional() }).strict() }).strict();
 var worktreeContract = z2.object({ repository: id2, baseRevision: id2, branchName: id2, worktreePath: id2, gitDir: id2.optional(), cleanupPolicy: z2.enum(["retain-until-review", "retain-until-integration", "remove-after-candidate"]), workspaceLease: id2 }).strict();
+var worktreeContractSchema = worktreeContract;
 var attemptRoute = z2.object({ catscoProjectId: id2, workerTopicId: id2, evidenceTopicId: id2, stewardTopicId: id2, stewardPrincipal: id2 }).strict();
 var bundlePayload = z2.object({ workItemId: id2, expectedRevision: z2.number().int().positive(), attemptId: id2, attemptNumber: z2.number().int().positive(), generation: z2.number().int().nonnegative(), runtimePrincipal: id2, proofMode: z2.enum(["ed25519", "catsco-message"]).optional(), proofKeyId: id2.optional(), proofPublicKey: id2.optional(), leaseExpiresAt: z2.string().datetime(), workBundle: z2.object({ contractDigest: hash2, instructions: id2, deliverables: z2.array(id2) }).strict(), attemptRoute: attemptRoute.optional(), ...contracts }).strict();
 var bundle = z2.object({ ...base, type: z2.literal("work_bundle_proposed"), payload: bundlePayload }).strict();
@@ -101,37 +102,13 @@ var reviewSubmission = z2.object({ targetTopicId: attemptTopicId, event: review 
   if (submission.event.source !== payload.reviewerPrincipal) context.addIssue({ code: "custom", path: ["event", "source"], message: "Review source must match reviewerPrincipal" });
 });
 var planEvent = z2.union([registered, bundle]);
-var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
-function parsePlan(raw) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("plan file is not valid JSON");
-  }
-  if (!Array.isArray(value) || value.length !== 2) throw new Error("plan file must be an array of exactly two events");
-  const parsed = value.map((item) => planEvent.parse(item));
-  const registration = parsed[0], proposed = parsed[1];
-  if (registration.type !== "work_item_registered" || proposed.type !== "work_bundle_proposed") throw new Error("plan must contain work_item_registered followed by work_bundle_proposed");
-  const r = registration.payload, b = proposed.payload;
-  if (r.workItemId !== b.workItemId) throw new Error("plan Work Item IDs must match");
-  if (b.expectedRevision !== 1) throw new Error("new plan bundle expectedRevision must be 1");
-  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (r[key] !== b[key]) throw new Error(`plan contract mismatch: ${key}`);
-  if (!r.workerTopicId || !r.stewardTopicId || r.workerTopicId === r.stewardTopicId) throw new Error("plan requires distinct worker and steward topics");
-  if (r.evidenceTopicId !== void 0) {
-    if (!/^grp_[1-9]\d*$/.test(r.evidenceTopicId)) throw new Error("evidenceTopicId must be a CatsCo group topic");
-    if ((/* @__PURE__ */ new Set([r.workerTopicId, r.evidenceTopicId, r.stewardTopicId])).size !== 3) throw new Error("plan requires distinct worker, evidence, and steward topics");
-  }
-  const numericCatscoPrincipal = /^catsco-user:[1-9]\d*$/;
-  if (r.stewardTopicId.startsWith("grp_") && (!r.stewardPrincipal || !numericCatscoPrincipal.test(r.stewardPrincipal))) throw new Error("group Steward topic requires a numeric CatsCo principal");
-  if (r.stewardPrincipal !== void 0 && !r.stewardPrincipal.startsWith("catsco-user:")) throw new Error("plan stewardPrincipal must be a CatsCo principal");
-  if ((b.proofMode ?? "ed25519") === "catsco-message" && !b.runtimePrincipal.startsWith("catsco-user:")) throw new Error("CatsCo-message bundle requires a CatsCo runtime principal");
-  if (b.proofMode === "ed25519" && (!b.proofKeyId || !b.proofPublicKey)) throw new Error("Ed25519 bundle requires proof key fields");
-  return parsed;
+var canonical = (value) => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value;
+function canonicalJson(value) {
+  return JSON.stringify(canonical(value));
 }
+var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 
 // src/lib/loopctl.ts
-import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { realpath, lstat, open } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -139,50 +116,7 @@ import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
 var MAX_INPUT = 512 * 1024;
-var timeoutMs = 3e4;
 var jsonValue = z3.unknown();
-function binary() {
-  return process.env.LOOPCTL_BINARY?.trim() || "loopctl";
-}
-async function runLoopctl(args, input) {
-  if (args.length > 8 || args.some((arg) => arg.length > 4096 || arg.includes("\0"))) {
-    throw new CommandExecutionError("invalid loopctl arguments");
-  }
-  if (input && Buffer.byteLength(input) > MAX_INPUT) throw new CommandExecutionError("loopctl input is too large");
-  return await new Promise((resolveResult, reject) => {
-    const child = spawn(binary(), args, { shell: false, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "", stderr = "", killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT) {
-        killed = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk).slice(0, 4096);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(new CommandExecutionError(`loopctl unavailable: ${error.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) return reject(new CommandExecutionError("loopctl timed out or produced too much output"));
-      if (code !== 0) return reject(new CommandExecutionError(`loopctl failed (exit ${code ?? 1})`));
-      try {
-        resolveResult(JSON.parse(stdout));
-      } catch {
-        reject(new CommandExecutionError("loopctl returned invalid JSON"));
-      }
-    });
-    child.stdin.end(input ?? "");
-  });
-}
 async function readConfinedFile(file) {
   if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
   const cwd = resolve(process.cwd());
@@ -194,8 +128,8 @@ async function readConfinedFile(file) {
   if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
   const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("input file must remain a regular file");
+    const stat2 = await handle.stat();
+    if (!stat2.isFile()) throw new Error("input file must remain a regular file");
     const value = await handle.readFile("utf8");
     if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
     return value;
@@ -203,19 +137,87 @@ async function readConfinedFile(file) {
     await handle.close();
   }
 }
-var unwrap = (value) => {
-  if (value && typeof value === "object" && "data" in value) return value.data;
-  return value;
-};
 
 // src/lib/catsco.ts
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
 
 // src/lib/exclusive-lock.ts
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, open as open2, readFile, stat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 var DEFAULT_STALE_MS = 15 * 6e4;
+function staleMs() {
+  const value = Number(process.env.LOOPCTL_LOCK_STALE_MS ?? DEFAULT_STALE_MS);
+  if (!Number.isFinite(value) || value < 1e3) throw new Error("LOOPCTL_LOCK_STALE_MS must be at least 1000 milliseconds");
+  return value;
+}
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+async function canReclaim(path) {
+  const timeout = staleMs();
+  const metadata = await stat(path);
+  let record = {};
+  try {
+    record = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+  }
+  const created = Date.parse(typeof record.createdAt === "string" ? record.createdAt : metadata.mtime.toISOString());
+  const pid = Number(record.pid);
+  if (Number.isSafeInteger(pid) && pid > 0) return !processIsAlive(pid);
+  const age = Number.isFinite(created) ? Date.now() - created : Number.POSITIVE_INFINITY;
+  return age >= timeout;
+}
+async function acquireExclusiveLock(path, label) {
+  await mkdir(dirname(path), { recursive: true, mode: 448 });
+  const token = randomUUID();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const handle = await open2(path, "wx", 384);
+      const record = { schema: "loopctl-exclusive-lock-v1", token, pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      try {
+        await handle.writeFile(`${JSON.stringify(record)}
+`, "utf8");
+        await handle.sync();
+        await chmod(path, 384);
+      } catch (error) {
+        await handle.close();
+        await unlink(path).catch(() => void 0);
+        throw error;
+      }
+      await handle.close();
+      return {
+        release: async () => {
+          try {
+            const current = JSON.parse(await readFile(path, "utf8"));
+            if (current.token === token) await unlink(path);
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (!await canReclaim(path)) throw new Error(`${label} is already active`);
+      await unlink(path).catch(() => void 0);
+    }
+  }
+  throw new Error(`${label} could not acquire a recovered lock`);
+}
 
 // src/lib/workspace.ts
+import { createHash, randomUUID as randomUUID2 } from "node:crypto";
+import { chmod as chmod2, lstat as lstat2, mkdir as mkdir2, readFile as readFile2, realpath as realpath2, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join, normalize, relative as relative2, resolve as resolve2 } from "node:path";
+import { spawn } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
 import { z as z4 } from "zod";
 var id3 = z4.string().min(1);
@@ -226,48 +228,160 @@ var packetSchema = z4.object({
   workBundle: z4.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
+var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
+function workspaceRegistryDirectory() {
+  return resolve2(process.env.LOOPCTL_WORKSPACE_REGISTRY_DIR?.trim() || join(homedir(), ".local", "state", "loopctl", "workspaces"));
+}
+async function git(gitDir, args) {
+  return await new Promise((resolveResult, reject) => {
+    const child = spawn("git", ["-C", gitDir, ...args], { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", killed = false;
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (Buffer.byteLength(stdout) > MAX_OUTPUT3) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+      if (Buffer.byteLength(stderr) > MAX_OUTPUT3) {
+        killed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.on("error", (error) => reject(new CommandExecutionError3(`git workspace preparation unavailable: ${error.message}`)));
+    child.on("close", (code) => {
+      if (killed) return reject(new CommandExecutionError3("git workspace preparation produced too much output"));
+      if (code !== 0) return reject(new CommandExecutionError3(`git workspace preparation failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
+      resolveResult(stdout.trim());
+    });
+  });
+}
+function contractFromInstructions(instructions) {
+  const marker = "LOOP_WORKTREE_CONTRACT_V1=";
+  const lines = instructions.split("\n").filter((line) => line.startsWith(marker));
+  if (lines.length !== 1) throw new CommandExecutionError3("execute packet requires exactly one LOOP_WORKTREE_CONTRACT_V1 line");
+  try {
+    return worktreeContractSchema.parse(JSON.parse(lines[0].slice(marker.length)));
+  } catch {
+    throw new CommandExecutionError3("execute packet carries an invalid worktree contract");
+  }
+}
+function normalizedAbsolute(path, label) {
+  if (!isAbsolute2(path) || normalize(path) !== path) throw new CommandExecutionError3(`${label} must be normalized and absolute`);
+  return resolve2(path);
+}
+function registeredWorktree(list, path, branch) {
+  const records = list.split("\n\n").map((record) => Object.fromEntries(record.split("\n").map((line) => {
+    const index = line.indexOf(" ");
+    return index < 0 ? [line, ""] : [line.slice(0, index), line.slice(index + 1)];
+  })));
+  return records.some((record) => record.worktree === path && record.branch === `refs/heads/${branch}`);
+}
+async function claimLease(value) {
+  const directory = workspaceRegistryDirectory();
+  await mkdir2(directory, { recursive: true, mode: 448 });
+  await chmod2(directory, 448);
+  const key = digest({ workspaceLease: value.workspaceLease });
+  const path = join(directory, `${key}.json`);
+  const lock = await acquireExclusiveLock(`${path}.lock`, `workspace lease ${String(value.workspaceLease)}`);
+  try {
+    const expectedDigest = digest(value);
+    try {
+      const current = JSON.parse(await readFile2(path, "utf8"));
+      if (current.digest !== expectedDigest) throw new CommandExecutionError3("workspace lease is already bound to a different contract");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const temporary = `${path}.${process.pid}.${randomUUID2()}.tmp`;
+      await writeFile2(temporary, `${JSON.stringify({ schema: "loopctl-workspace-lease-v1", digest: expectedDigest, contract: value }, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+      await chmod2(temporary, 384);
+      await rename(temporary, path);
+    }
+  } catch (error) {
+    await lock.release();
+    throw error;
+  }
+  return { release: async () => lock.release() };
+}
+async function prepareWorkspaceFromPacket(raw) {
+  let packet;
+  try {
+    packet = packetSchema.parse(raw);
+  } catch {
+    throw new CommandExecutionError3("workspace-prepare requires an execute_attempt packet");
+  }
+  const contract = contractFromInstructions(packet.workBundle.instructions);
+  if (!contract.gitDir) throw new CommandExecutionError3("worktree contract must include gitDir for workspace-prepare");
+  const worktreePath = normalizedAbsolute(contract.worktreePath, "worktreePath");
+  const gitDir = normalizedAbsolute(contract.gitDir, "gitDir");
+  if (!contract.branchName.startsWith(`loop/${packet.loopId}/`)) throw new CommandExecutionError3("worktree branch must be scoped to the packet loopId");
+  if (worktreePath === gitDir || relative2(gitDir, worktreePath) === "") throw new CommandExecutionError3("worktreePath must differ from gitDir");
+  const baseRevision = await git(gitDir, ["rev-parse", `${contract.baseRevision}^{commit}`]);
+  const contractDigest = digest(contract);
+  const lease = await claimLease({ worktreePath, gitDir, branchName: contract.branchName, baseRevision, workspaceLease: contract.workspaceLease, contractDigest });
+  let state;
+  try {
+    try {
+      const stat2 = await lstat2(worktreePath);
+      if (!stat2.isDirectory() || stat2.isSymbolicLink()) throw new CommandExecutionError3("existing worktreePath is not a regular directory");
+      const list = await git(gitDir, ["worktree", "list", "--porcelain"]);
+      const actualWorktreePath = await realpath2(worktreePath);
+      if (!registeredWorktree(list, actualWorktreePath, contract.branchName)) {
+        throw new CommandExecutionError3("existing worktreePath is not registered to the required branch");
+      }
+      const head = await git(worktreePath, ["rev-parse", "HEAD"]);
+      if (head !== baseRevision) throw new CommandExecutionError3("existing worktree HEAD does not match the contract base revision");
+      state = "verified";
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await mkdir2(dirname2(worktreePath), { recursive: true, mode: 448 });
+      await git(gitDir, ["worktree", "add", "-b", contract.branchName, worktreePath, baseRevision]);
+      state = "created";
+    }
+    const receipt = {
+      schema: "loopctl-workspace-receipt-v1",
+      state,
+      worktreePath,
+      gitDir,
+      branchName: contract.branchName,
+      baseRevision,
+      workspaceLease: contract.workspaceLease,
+      contractDigest
+    };
+    return { ...receipt, receiptDigest: digest(receipt) };
+  } catch (error) {
+    if (state === "created") {
+      await git(gitDir, ["worktree", "remove", "--force", worktreePath]).catch(() => void 0);
+    }
+    throw error;
+  } finally {
+    await lease.release();
+  }
+}
 
 // src/lib/commands.ts
-var parseResponse = (schema, value, label) => {
+async function workspacePrepare(kwargs) {
+  let packet;
   try {
-    return schema.parse(value);
-  } catch {
-    throw new CommandExecutionError4(`loopctl returned malformed ${label} JSON`);
-  }
-};
-var assertAcceptedReceipt = (value) => {
-  const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
-  return receipt;
-};
-async function ingest(event) {
-  return assertAcceptedReceipt(unwrap(await runLoopctl(["ingest", "--file", "-"], `${JSON.stringify(event)}
-`)));
-}
-async function tick() {
-  return parseResponse(tickSchema, unwrap(await runLoopctl(["tick"])), "tick");
-}
-var readPlan = async (file) => {
-  try {
-    return parsePlan(await readConfinedFile(file));
+    packet = JSON.parse(await readConfinedFile(String(kwargs["packet-file"])));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid plan file");
+    throw new ArgumentError(error instanceof Error ? error.message : "invalid execute packet file");
   }
-};
-async function next(kwargs) {
-  const actionId = String(kwargs["plan-next-action-id"] ?? "");
-  if (!actionId) throw new ArgumentError("next requires --plan-next-action-id");
-  const packet = parseResponse(actionPacketSchema, unwrap(await runLoopctl(["packet", "--action-id", actionId])), "packet");
-  if (packet.kind !== "plan_next" || !["accepted", "closed"].includes(packet.completedWorkItem.state) || !["ready", "satisfied"].includes(packet.action.state)) throw new ArgumentError("plan_next action is stale or not current");
-  const events = await readPlan(String(kwargs["plan-file"]));
-  const registration = events[0];
-  if (registration.payload.loopId !== packet.loopId) throw new ArgumentError("next plan loopId does not match plan_next packet");
-  if (registration.payload.workItemId === packet.completedWorkItem.workItemId) throw new ArgumentError("next plan must use a new Work Item ID");
-  const receipts = [];
-  receipts.push(await ingest(events[0]));
-  receipts.push(await ingest(events[1]));
-  return { planNextPacket: packet, receipts, tick: await tick() };
+  return prepareWorkspaceFromPacket(packet);
 }
 
-// loop-next.ts
-cli({ site: "loop", name: "next", description: "Review-only: start the next Work Item in a loop", access: "write", browser: false, strategy: Strategy.LOCAL, args: [{ name: "plan-next-action-id", help: "Current plan_next action id", required: true }, { name: "plan-file", help: "Plan JSON file", required: true }], columns: ["planNextPacket", "receipts", "tick"], defaultFormat: "json", func: next });
+// loop-workspace-prepare.ts
+cli({
+  site: "loop",
+  name: "workspace-prepare",
+  description: "Worker-only: create and verify the exact fenced Git worktree from an execute packet",
+  access: "write",
+  browser: false,
+  strategy: Strategy.LOCAL,
+  args: [{ name: "packet-file", help: "Relative execute_attempt packet JSON file", required: true }],
+  columns: ["state", "worktreePath", "gitDir", "branchName", "baseRevision", "workspaceLease", "receiptDigest"],
+  defaultFormat: "json",
+  func: workspacePrepare
+});

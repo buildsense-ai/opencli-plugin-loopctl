@@ -1,4 +1,4 @@
-// loop-agent-task-fanout.ts
+// loop-agent-task-retry.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
@@ -62,7 +62,6 @@ var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId:
 var actionPacketSchema = z.discriminatedUnion("kind", [attemptPacket, recoveryPacket, reviewPacket, nextPacket]);
 
 // src/lib/events.ts
-import { posix } from "node:path";
 import { z as z2 } from "zod";
 var id2 = z2.string().min(1);
 var hash2 = z2.string().min(8);
@@ -71,6 +70,7 @@ var contracts = { taskContractHash: hash2, referenceSnapshotHash: hash2, writeSc
 var deliverable = z2.object({ kind: z2.literal("github_pr"), repository: id2, prNumber: z2.number().int().positive(), headSha: id2, baseSha: id2, digest: hash2 }).strict();
 var registered = z2.object({ ...base, type: z2.literal("work_item_registered"), payload: z2.object({ workItemId: id2, loopId: id2, profileId: id2, terminalState: z2.enum(["accepted", "closed"]), ...contracts, writeScope: z2.array(id2), githubRepo: id2, catscoProjectId: id2, workerTopicId: id2, evidenceTopicId: id2.optional(), stewardTopicId: id2, stewardPrincipal: id2.optional() }).strict() }).strict();
 var worktreeContract = z2.object({ repository: id2, baseRevision: id2, branchName: id2, worktreePath: id2, gitDir: id2.optional(), cleanupPolicy: z2.enum(["retain-until-review", "retain-until-integration", "remove-after-candidate"]), workspaceLease: id2 }).strict();
+var worktreeContractSchema = worktreeContract;
 var attemptRoute = z2.object({ catscoProjectId: id2, workerTopicId: id2, evidenceTopicId: id2, stewardTopicId: id2, stewardPrincipal: id2 }).strict();
 var bundlePayload = z2.object({ workItemId: id2, expectedRevision: z2.number().int().positive(), attemptId: id2, attemptNumber: z2.number().int().positive(), generation: z2.number().int().nonnegative(), runtimePrincipal: id2, proofMode: z2.enum(["ed25519", "catsco-message"]).optional(), proofKeyId: id2.optional(), proofPublicKey: id2.optional(), leaseExpiresAt: z2.string().datetime(), workBundle: z2.object({ contractDigest: hash2, instructions: id2, deliverables: z2.array(id2) }).strict(), attemptRoute: attemptRoute.optional(), ...contracts }).strict();
 var bundle = z2.object({ ...base, type: z2.literal("work_bundle_proposed"), payload: bundlePayload }).strict();
@@ -102,98 +102,11 @@ var reviewSubmission = z2.object({ targetTopicId: attemptTopicId, event: review 
   if (submission.event.source !== payload.reviewerPrincipal) context.addIssue({ code: "custom", path: ["event", "source"], message: "Review source must match reviewerPrincipal" });
 });
 var planEvent = z2.union([registered, bundle]);
+var canonical = (value) => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value;
+function canonicalJson(value) {
+  return JSON.stringify(canonical(value));
+}
 var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
-function parseFanout(raw) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("fanout file is not valid JSON");
-  }
-  if (!Array.isArray(value) || value.length < 4 || value.length % 2 !== 0) throw new Error("fanout file must contain at least two registration/bundle pairs");
-  const parsed = value.map((item) => planEvent.parse(item));
-  const loopIds = new Set(parsed.filter((e) => e.type === "work_item_registered").map((e) => e.payload.loopId));
-  if (loopIds.size !== 1) throw new Error("fanout plans must share one loopId");
-  const workItems = /* @__PURE__ */ new Set(), attempts = /* @__PURE__ */ new Set(), branches = /* @__PURE__ */ new Set(), paths = /* @__PURE__ */ new Set(), leases = /* @__PURE__ */ new Set(), workerTopics = /* @__PURE__ */ new Set(), eventIds = /* @__PURE__ */ new Set(), idempotencyKeys = /* @__PURE__ */ new Set();
-  for (let i = 0; i < parsed.length; i += 2) {
-    const r = parsed[i], b = parsed[i + 1];
-    if (r.type !== "work_item_registered" || b.type !== "work_bundle_proposed") throw new Error("fanout must contain registration/bundle pairs");
-    for (const event of [r, b]) {
-      if (eventIds.has(event.eventId) || idempotencyKeys.has(event.idempotencyKey)) throw new Error("fanout event IDs and idempotency keys must be unique");
-      eventIds.add(event.eventId);
-      idempotencyKeys.add(event.idempotencyKey);
-    }
-    if (r.payload.workItemId !== b.payload.workItemId || b.payload.expectedRevision !== 1) throw new Error("fanout pair identity or revision mismatch");
-    if (workItems.has(r.payload.workItemId) || attempts.has(b.payload.attemptId)) throw new Error("fanout IDs must be unique");
-    const marker = "LOOP_WORKTREE_CONTRACT_V1=";
-    const lines = b.payload.workBundle.instructions.split("\n").filter((value2) => value2.startsWith(marker));
-    if (lines.length !== 1) throw new Error("fanout bundle requires exactly one LOOP_WORKTREE_CONTRACT_V1 line");
-    let wt;
-    try {
-      wt = worktreeContract.parse(JSON.parse(lines[0].slice(marker.length)));
-    } catch {
-      throw new Error("fanout worktree contract is invalid");
-    }
-    if (!posix.isAbsolute(wt.worktreePath) || posix.normalize(wt.worktreePath) !== wt.worktreePath) throw new Error("fanout worktreePath must be normalized and absolute");
-    const normalizedPath = wt.worktreePath;
-    if (wt.repository !== r.payload.githubRepo) throw new Error("worktree repository must match githubRepo");
-    if (!wt.branchName.startsWith(`loop/${r.payload.loopId}/`)) throw new Error("worktree branch must be scoped to loopId");
-    if (branches.has(wt.branchName) || paths.has(normalizedPath) || leases.has(wt.workspaceLease) || workerTopics.has(r.payload.workerTopicId)) throw new Error("fanout worker topics, worktrees, and workspace leases must be unique");
-    workItems.add(r.payload.workItemId);
-    attempts.add(b.payload.attemptId);
-    branches.add(wt.branchName);
-    paths.add(normalizedPath);
-    leases.add(wt.workspaceLease);
-    workerTopics.add(r.payload.workerTopicId);
-    parsePlan(JSON.stringify([r, b]));
-  }
-  return parsed;
-}
-function parseAgentTaskFanout(raw) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("agent-task fanout file is not valid JSON");
-  }
-  if (!Array.isArray(value) || value.length < 4 || value.length % 2 !== 0) throw new Error("agent-task fanout file must contain at least two registration/bundle pairs");
-  const parsed = value.map((item) => planEvent.parse(item));
-  const provisional = parsed.map((event, index) => {
-    if (index % 2 !== 0 || event.type !== "work_item_registered") return event;
-    const match = /^agent-task:([1-9]\d*)$/.exec(event.payload.workerTopicId);
-    if (!match) throw new Error(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${event.payload.workItemId}`);
-    return { ...event, payload: { ...event.payload, workerTopicId: `agent-task:${match[1]}:${event.payload.workItemId}` } };
-  });
-  parseFanout(JSON.stringify(provisional));
-  return parsed;
-}
-function parsePlan(raw) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("plan file is not valid JSON");
-  }
-  if (!Array.isArray(value) || value.length !== 2) throw new Error("plan file must be an array of exactly two events");
-  const parsed = value.map((item) => planEvent.parse(item));
-  const registration = parsed[0], proposed = parsed[1];
-  if (registration.type !== "work_item_registered" || proposed.type !== "work_bundle_proposed") throw new Error("plan must contain work_item_registered followed by work_bundle_proposed");
-  const r = registration.payload, b = proposed.payload;
-  if (r.workItemId !== b.workItemId) throw new Error("plan Work Item IDs must match");
-  if (b.expectedRevision !== 1) throw new Error("new plan bundle expectedRevision must be 1");
-  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (r[key] !== b[key]) throw new Error(`plan contract mismatch: ${key}`);
-  if (!r.workerTopicId || !r.stewardTopicId || r.workerTopicId === r.stewardTopicId) throw new Error("plan requires distinct worker and steward topics");
-  if (r.evidenceTopicId !== void 0) {
-    if (!/^grp_[1-9]\d*$/.test(r.evidenceTopicId)) throw new Error("evidenceTopicId must be a CatsCo group topic");
-    if ((/* @__PURE__ */ new Set([r.workerTopicId, r.evidenceTopicId, r.stewardTopicId])).size !== 3) throw new Error("plan requires distinct worker, evidence, and steward topics");
-  }
-  const numericCatscoPrincipal = /^catsco-user:[1-9]\d*$/;
-  if (r.stewardTopicId.startsWith("grp_") && (!r.stewardPrincipal || !numericCatscoPrincipal.test(r.stewardPrincipal))) throw new Error("group Steward topic requires a numeric CatsCo principal");
-  if (r.stewardPrincipal !== void 0 && !r.stewardPrincipal.startsWith("catsco-user:")) throw new Error("plan stewardPrincipal must be a CatsCo principal");
-  if ((b.proofMode ?? "ed25519") === "catsco-message" && !b.runtimePrincipal.startsWith("catsco-user:")) throw new Error("CatsCo-message bundle requires a CatsCo runtime principal");
-  if (b.proofMode === "ed25519" && (!b.proofKeyId || !b.proofPublicKey)) throw new Error("Ed25519 bundle requires proof key fields");
-  return parsed;
-}
 
 // src/lib/loopctl.ts
 import { spawn } from "node:child_process";
@@ -259,8 +172,8 @@ async function readConfinedFile(file) {
   if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
   const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("input file must remain a regular file");
+    const stat2 = await handle.stat();
+    if (!stat2.isFile()) throw new Error("input file must remain a regular file");
     const value = await handle.readFile("utf8");
     if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
     return value;
@@ -288,7 +201,7 @@ function asRecord(value, label) {
   return row2;
 }
 async function runOpenCli(args) {
-  return await new Promise((resolve2, reject) => {
+  return await new Promise((resolve3, reject) => {
     const child = spawn2(process.env.OPENCLI_BINARY?.trim() || "opencli", args, { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -316,7 +229,7 @@ async function runOpenCli(args) {
       if (killed) return reject(new CommandExecutionError2("CatsCo provisioning timed out or produced too much output"));
       if (code !== 0) return reject(new CommandExecutionError2(`CatsCo provisioning failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
       try {
-        resolve2(JSON.parse(stdout));
+        resolve3(JSON.parse(stdout));
       } catch {
         reject(new CommandExecutionError2("CatsCo provisioning returned invalid JSON"));
       }
@@ -344,6 +257,21 @@ async function groupInfo(groupId) {
   }
   return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
 }
+async function createStandardTopic(name, agentUids) {
+  const ownerUid = await currentCatscoUid();
+  const expected = [...new Set(agentUids)].sort();
+  if (!name || name.length > 180 || expected.length === 0 || expected.some((uid) => !/^[1-9]\d*$/.test(uid))) {
+    throw new CommandExecutionError2("standard evidence/review topic request is invalid");
+  }
+  const created = asRecord(await runOpenCli(["catsco", "group-create", name, expected.join(","), "--kind", "standard", "--format", "json"]), "standard topic provisioning");
+  const groupId = String(created.groupId ?? created.group_id ?? "");
+  if (!/^[1-9]\d*$/.test(groupId)) throw new CommandExecutionError2("CatsCo standard topic provisioning returned an invalid group id");
+  const topology = await groupInfo(groupId);
+  if (topology.kind !== "standard" || topology.agentIds.split(",").filter(Boolean).sort().join(",") !== expected.join(",") || !topology.memberIds.split(",").filter(Boolean).includes(ownerUid)) {
+    throw new CommandExecutionError2("CatsCo standard topic topology failed verification");
+  }
+  return { ...topology, kind: "standard" };
+}
 async function createAgentTaskTopic(name, workerAgentUid) {
   const ownerUid = await currentCatscoUid();
   if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError2("agent-task Worker UID must be numeric");
@@ -366,20 +294,6 @@ async function createAgentTaskTopic(name, workerAgentUid) {
   }
   return { groupId, topic, kind: "agent_task", agentIds };
 }
-async function resolveLoopProject(loopId, requestedProjectId) {
-  if (/^[1-9]\d*$/.test(requestedProjectId)) return requestedProjectId;
-  if (requestedProjectId !== "project:auto") throw new CommandExecutionError2("catscoProjectId must be numeric or project:auto");
-  const name = `Loop ${loopId}`;
-  const listed = unwrap2(await runOpenCli(["catsco", "projects", "--format", "json"]));
-  if (!Array.isArray(listed)) throw new CommandExecutionError2("CatsCo Projects returned invalid JSON");
-  const existing = listed.find((row2) => row2 && typeof row2 === "object" && String(row2.name ?? "") === name);
-  if (existing && /^[1-9]\d*$/.test(String(existing.id ?? ""))) return String(existing.id);
-  const created = unwrap2(await runOpenCli(["catsco", "project-create", name, "--format", "json"]));
-  if (!created || typeof created !== "object" || !/^[1-9]\d*$/.test(String(created.id ?? ""))) {
-    throw new CommandExecutionError2("CatsCo Project allocation returned an invalid Project id");
-  }
-  return String(created.id);
-}
 async function attachTopicToProject(projectId, topic) {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
   await runOpenCli(["catsco", "project-assign-topic", projectId, topic, "--format", "json"]);
@@ -389,8 +303,143 @@ async function attachTopicToProject(projectId, topic) {
   }
 }
 
+// src/lib/provisioning-journal.ts
+import { createHash } from "node:crypto";
+import { chmod as chmod2, mkdir as mkdir2, readFile as readFile2, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, resolve as resolve2 } from "node:path";
+
 // src/lib/exclusive-lock.ts
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, open as open2, readFile, stat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 var DEFAULT_STALE_MS = 15 * 6e4;
+function staleMs() {
+  const value = Number(process.env.LOOPCTL_LOCK_STALE_MS ?? DEFAULT_STALE_MS);
+  if (!Number.isFinite(value) || value < 1e3) throw new Error("LOOPCTL_LOCK_STALE_MS must be at least 1000 milliseconds");
+  return value;
+}
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+async function canReclaim(path) {
+  const timeout = staleMs();
+  const metadata = await stat(path);
+  let record = {};
+  try {
+    record = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+  }
+  const created = Date.parse(typeof record.createdAt === "string" ? record.createdAt : metadata.mtime.toISOString());
+  const pid = Number(record.pid);
+  if (Number.isSafeInteger(pid) && pid > 0) return !processIsAlive(pid);
+  const age = Number.isFinite(created) ? Date.now() - created : Number.POSITIVE_INFINITY;
+  return age >= timeout;
+}
+async function acquireExclusiveLock(path, label) {
+  await mkdir(dirname(path), { recursive: true, mode: 448 });
+  const token = randomUUID();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const handle = await open2(path, "wx", 384);
+      const record = { schema: "loopctl-exclusive-lock-v1", token, pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      try {
+        await handle.writeFile(`${JSON.stringify(record)}
+`, "utf8");
+        await handle.sync();
+        await chmod(path, 384);
+      } catch (error) {
+        await handle.close();
+        await unlink(path).catch(() => void 0);
+        throw error;
+      }
+      await handle.close();
+      return {
+        release: async () => {
+          try {
+            const current = JSON.parse(await readFile(path, "utf8"));
+            if (current.token === token) await unlink(path);
+          } catch (error) {
+            if (error.code !== "ENOENT") throw error;
+          }
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (!await canReclaim(path)) throw new Error(`${label} is already active`);
+      await unlink(path).catch(() => void 0);
+    }
+  }
+  throw new Error(`${label} could not acquire a recovered lock`);
+}
+
+// src/lib/provisioning-journal.ts
+var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
+var now = () => (/* @__PURE__ */ new Date()).toISOString();
+function directory() {
+  return resolve2(process.env.LOOPCTL_PROVISION_JOURNAL_DIR?.trim() || join(homedir(), ".local", "state", "loopctl", "provisioning"));
+}
+async function persist(path, value) {
+  const dir = directory();
+  await mkdir2(dir, { recursive: true, mode: 448 });
+  await chmod2(dir, 448);
+  const temporary = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await writeFile2(temporary, `${JSON.stringify(value, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+  await chmod2(temporary, 384);
+  await rename(temporary, path);
+}
+async function openProvisionJournal(kind, plan) {
+  const planDigest = digest(plan);
+  const id4 = `${kind}:${planDigest}`;
+  const path = join(directory(), `${kind}-${planDigest}.json`);
+  const dir = directory();
+  await mkdir2(dir, { recursive: true, mode: 448 });
+  await chmod2(dir, 448);
+  const lock = await acquireExclusiveLock(`${path}.lock`, `provisioning journal ${id4}`);
+  let journal;
+  try {
+    try {
+      journal = JSON.parse(await readFile2(path, "utf8"));
+      if (journal.schema !== "loopctl-provision-journal-v1" || journal.kind !== kind || journal.planDigest !== planDigest || journal.id !== id4) {
+        throw new Error("provisioning journal identity does not match the requested plan");
+      }
+      if (journal.phase !== "validated" && journal.phase !== "failed") {
+        throw new Error(`provisioning journal requires explicit recovery before resume: ${journal.phase}`);
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const timestamp = now();
+      journal = {
+        schema: "loopctl-provision-journal-v1",
+        id: id4,
+        kind,
+        planDigest,
+        phase: "validated",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        manualCleanupTopicIds: []
+      };
+      await persist(path, journal);
+    }
+  } catch (error) {
+    await lock.release();
+    throw error;
+  }
+  const release = async () => lock.release();
+  const save = async (patch) => {
+    journal = { ...journal, ...patch, updatedAt: now() };
+    await persist(path, journal);
+    return journal;
+  };
+  return { journal: () => journal, path, save, release };
+}
 
 // src/lib/workspace.ts
 import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
@@ -417,6 +466,9 @@ var assertAcceptedReceipt = (value) => {
   if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
   return receipt;
 };
+async function packet(kwargs) {
+  return parseResponse(actionPacketSchema, unwrap(await runLoopctl(["packet", "--action-id", String(kwargs["action-id"])])), "packet");
+}
 async function ingest(event) {
   return assertAcceptedReceipt(unwrap(await runLoopctl(["ingest", "--file", "-"], `${JSON.stringify(event)}
 `)));
@@ -424,48 +476,100 @@ async function ingest(event) {
 async function tick() {
   return parseResponse(tickSchema, unwrap(await runLoopctl(["tick"])), "tick");
 }
-async function agentTaskFanout(kwargs) {
-  let events;
+function bundleInstructions(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.instructions !== "string") {
+    throw new ArgumentError(`${label} does not contain work bundle instructions`);
+  }
+  return value.instructions;
+}
+function worktreeContract2(instructions, label) {
+  const marker = "LOOP_WORKTREE_CONTRACT_V1=";
+  const lines = instructions.split("\n").filter((line) => line.startsWith(marker));
+  if (lines.length !== 1) throw new ArgumentError(`${label} requires exactly one LOOP_WORKTREE_CONTRACT_V1 line`);
   try {
-    events = parseAgentTaskFanout(await readConfinedFile(String(kwargs["plan-file"])));
+    return worktreeContractSchema.parse(JSON.parse(lines[0].slice(marker.length)));
+  } catch {
+    throw new ArgumentError(`${label} worktree contract is invalid`);
+  }
+}
+async function agentTaskRetry(kwargs) {
+  let recoveryPacket2;
+  let retry;
+  try {
+    recoveryPacket2 = actionPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs["packet-file"]))));
+    if (recoveryPacket2.kind !== "recover_attempt" || !["ready", "satisfied"].includes(recoveryPacket2.action.state)) throw new Error("recovery packet is stale or not actionable");
+    retry = bundle.parse(JSON.parse(await readConfinedFile(String(kwargs["event-file"]))));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid agent-task fanout file");
+    throw new ArgumentError(error instanceof Error ? error.message : "invalid recovery packet or bundle");
   }
-  const loopId = events[0]?.type === "work_item_registered" ? events[0].payload.loopId : "";
-  const requestedProjects = new Set(events.filter((_, index) => index % 2 === 0).map((event) => String(event.payload.catscoProjectId)));
-  if (requestedProjects.size !== 1) throw new ArgumentError("agent-task fanout requires one shared catscoProjectId allocation");
-  const projectId = await resolveLoopProject(loopId, [...requestedProjects][0]);
-  const provisionedTopics = [];
-  const rewritten = [];
-  for (let index = 0; index < events.length; index += 2) {
-    const registration = events[index];
-    const bundleEvent = events[index + 1];
-    const placeholder = /^agent-task:([1-9]\d*)$/.exec(registration.payload.workerTopicId);
-    if (!placeholder) throw new ArgumentError(`agent-task fanout requires workerTopicId agent-task:<WorkerAgentUid> for ${registration.payload.workItemId}`);
-    const workerAgentUid = placeholder[1];
-    if (bundleEvent.payload.runtimePrincipal !== `catsco-user:${workerAgentUid}`) throw new ArgumentError(`agent-task runtime principal does not match Worker UID for ${registration.payload.workItemId}`);
-    const group = await createAgentTaskTopic(`Loop ${registration.payload.loopId} ${bundleEvent.payload.attemptId}`, workerAgentUid);
-    await attachTopicToProject(projectId, group.topic);
-    const allocated = { ...registration, payload: { ...registration.payload, catscoProjectId: projectId, workerTopicId: group.topic } };
-    rewritten.push(allocated, bundleEvent);
-    provisionedTopics.push({ workItemId: registration.payload.workItemId, attemptId: bundleEvent.payload.attemptId, topic: group.topic, groupId: group.groupId, projectId });
+  const p = retry.payload;
+  if (p.workItemId !== recoveryPacket2.workItemId || p.expectedRevision !== recoveryPacket2.workItemRevision) throw new ArgumentError("recovery bundle does not bind the current Work Item revision");
+  if (p.generation !== recoveryPacket2.previousAttempt.generation + 1 || p.attemptNumber !== recoveryPacket2.previousAttempt.attemptNumber + 1) throw new ArgumentError("recovery bundle must use exactly the next generation and attempt number");
+  if (p.runtimePrincipal !== recoveryPacket2.previousAttempt.runtimePrincipal) throw new ArgumentError("recovery bundle runtime principal does not match the fenced predecessor");
+  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (p[key] !== recoveryPacket2.contracts[key]) throw new ArgumentError(`recovery bundle contract mismatch: ${key}`);
+  const worker = /^catsco-user:([1-9]\d*)$/.exec(p.runtimePrincipal);
+  const reviewer = /^catsco-user:([1-9]\d*)$/.exec(recoveryPacket2.stewardPrincipal);
+  if (!worker || !reviewer || !/^\d+$/.test(recoveryPacket2.catscoProjectId)) throw new ArgumentError("recovery packet does not contain numeric CatsCo principals and Project");
+  const previousWorktree = worktreeContract2(bundleInstructions(recoveryPacket2.previousAttempt.workBundle, "recovery packet"), "recovery packet");
+  const nextWorktree = worktreeContract2(bundleInstructions(p.workBundle, "recovery bundle"), "recovery bundle");
+  if (!nextWorktree.gitDir) throw new ArgumentError("recovery bundle worktree contract requires gitDir for workspace-prepare");
+  if (previousWorktree.branchName === nextWorktree.branchName || previousWorktree.worktreePath === nextWorktree.worktreePath || previousWorktree.workspaceLease === nextWorktree.workspaceLease) {
+    throw new ArgumentError("recovery bundle must use a fresh branch, worktree path, and workspace lease");
   }
-  parseFanout(JSON.stringify(rewritten));
-  const receipts = [];
-  for (const event of rewritten) receipts.push(await ingest(event));
-  return { count: rewritten.length / 2, provisionedTopics, receipts, tick: await tick() };
+  const current = await packet({ "action-id": recoveryPacket2.actionId });
+  if (current.kind !== "recover_attempt" || current.packetDigest !== recoveryPacket2.packetDigest || !["ready", "satisfied"].includes(current.action.state)) {
+    throw new ArgumentError("recover_attempt packet is stale; no resources were provisioned");
+  }
+  const journalStore = await openProvisionJournal("agent-task-retry", { packet: recoveryPacket2, retry });
+  const asRecord2 = (topic) => ({
+    groupId: topic.groupId,
+    topic: topic.topic,
+    kind: topic.kind,
+    agentIds: topic.agentIds,
+    ...topic.memberIds ? { memberIds: topic.memberIds } : {}
+  });
+  try {
+    let journal = journalStore.journal();
+    const projectId = journal.projectId ?? recoveryPacket2.catscoProjectId;
+    if (!journal.projectId) journal = await journalStore.save({ phase: "project_resolved", projectId });
+    const workerTopic = journal.workerTopic ?? asRecord2(await createAgentTaskTopic(`Loop ${recoveryPacket2.loopId} ${p.attemptId} execution`, worker[1]));
+    if (!journal.workerTopic) journal = await journalStore.save({ phase: "topics_created", workerTopic, manualCleanupTopicIds: [...journal.manualCleanupTopicIds, workerTopic.topic] });
+    const evidenceTopic = journal.evidenceTopic ?? asRecord2(await createStandardTopic(`Loop ${recoveryPacket2.loopId} ${p.attemptId} evidence`, [worker[1], reviewer[1]]));
+    if (!journal.evidenceTopic) journal = await journalStore.save({ phase: "topics_created", evidenceTopic, manualCleanupTopicIds: [...journal.manualCleanupTopicIds, evidenceTopic.topic] });
+    const reviewTopic = journal.reviewTopic ?? asRecord2(await createStandardTopic(`Loop ${recoveryPacket2.loopId} ${p.attemptId} review`, [reviewer[1]]));
+    if (!journal.reviewTopic) journal = await journalStore.save({ phase: "topics_created", reviewTopic, manualCleanupTopicIds: [...journal.manualCleanupTopicIds, reviewTopic.topic] });
+    await attachTopicToProject(projectId, workerTopic.topic);
+    await attachTopicToProject(projectId, evidenceTopic.topic);
+    await attachTopicToProject(projectId, reviewTopic.topic);
+    journal = await journalStore.save({ phase: "topics_attached", projectId, workerTopic, evidenceTopic, reviewTopic });
+    const rewritten = { ...retry, payload: { ...p, attemptRoute: { catscoProjectId: projectId, workerTopicId: workerTopic.topic, evidenceTopicId: evidenceTopic.topic, stewardTopicId: reviewTopic.topic, stewardPrincipal: recoveryPacket2.stewardPrincipal } } };
+    const bundleReceipt = journal.bundleReceipt ?? await ingest(rewritten);
+    if (!journal.bundleReceipt) journal = await journalStore.save({ phase: "bundle_ingested", bundleReceipt });
+    const tickReceipt = journal.tick ?? await tick();
+    await journalStore.save({ phase: "completed", tick: tickReceipt });
+    return { projectId, provisionedTopics: { workerTopic, evidenceTopic, reviewTopic }, receipt: bundleReceipt, tick: tickReceipt, journalPath: journalStore.path };
+  } catch (error) {
+    const journal = journalStore.journal();
+    await journalStore.save({ phase: "failed", error: String(error instanceof Error ? error.message : error).slice(0, 1e3), manualCleanupTopicIds: journal.manualCleanupTopicIds });
+    throw error;
+  } finally {
+    await journalStore.release();
+  }
 }
 
-// loop-agent-task-fanout.ts
+// loop-agent-task-retry.ts
 cli({
   site: "loop",
-  name: "agent-task-fanout",
-  description: "Review-only: provision one CatsCo agent_task conversation per Attempt, then register and dispatch the fan-out",
+  name: "agent-task-retry",
+  description: "Review-only: provision fresh fenced Topics for a recover_attempt packet and submit its next-generation bundle",
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,
-  args: [{ name: "plan-file", help: "Fan-out JSON with workerTopicId agent-task:<WorkerAgentUid> placeholders", required: true }],
-  columns: ["count", "provisionedTopics", "receipts", "tick"],
+  args: [
+    { name: "packet-file", help: "Relative recover_attempt packet JSON file", required: true },
+    { name: "event-file", help: "Relative next-generation work_bundle_proposed JSON file", required: true }
+  ],
+  columns: ["projectId", "provisionedTopics", "receipt", "tick", "journalPath"],
   defaultFormat: "json",
-  func: agentTaskFanout
+  func: agentTaskRetry
 });

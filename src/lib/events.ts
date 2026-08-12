@@ -5,25 +5,42 @@ const id=z.string().min(1), hash=z.string().min(8)
 const base={eventId:id,idempotencyKey:id,source:id,entityRef:id}
 const contracts={taskContractHash:hash,referenceSnapshotHash:hash,writeScopeHash:hash,acceptanceContractHash:hash}
 const deliverable=z.object({kind:z.literal('github_pr'),repository:id,prNumber:z.number().int().positive(),headSha:id,baseSha:id,digest:hash}).strict()
-export const registered=z.object({...base,type:z.literal('work_item_registered'),payload:z.object({workItemId:id,loopId:id,profileId:id,terminalState:z.enum(['accepted','closed']),...contracts,writeScope:z.array(id),githubRepo:id,catscoProjectId:id,workerTopicId:id,stewardTopicId:id,stewardPrincipal:id.optional()}).strict()}).strict()
-const worktreeContract=z.object({repository:id,baseRevision:id,branchName:id,worktreePath:id,cleanupPolicy:z.enum(['retain-until-review','retain-until-integration','remove-after-candidate']),workspaceLease:id}).strict()
+export const registered=z.object({...base,type:z.literal('work_item_registered'),payload:z.object({workItemId:id,loopId:id,profileId:id,terminalState:z.enum(['accepted','closed']),...contracts,writeScope:z.array(id),githubRepo:id,catscoProjectId:id,workerTopicId:id,evidenceTopicId:id.optional(),stewardTopicId:id,stewardPrincipal:id.optional()}).strict()}).strict()
+const worktreeContract=z.object({repository:id,baseRevision:id,branchName:id,worktreePath:id,gitDir:id.optional(),cleanupPolicy:z.enum(['retain-until-review','retain-until-integration','remove-after-candidate']),workspaceLease:id}).strict()
 export const worktreeContractSchema=worktreeContract
-const bundlePayload=z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,attemptNumber:z.number().int().positive(),generation:z.number().int().nonnegative(),runtimePrincipal:id,proofMode:z.enum(['ed25519','catsco-message']).optional(),proofKeyId:id.optional(),proofPublicKey:id.optional(),leaseExpiresAt:z.string().datetime(),workBundle:z.object({contractDigest:hash,instructions:id,deliverables:z.array(id)}).strict(),...contracts}).strict()
+const attemptRoute=z.object({catscoProjectId:id,workerTopicId:id,evidenceTopicId:id,stewardTopicId:id,stewardPrincipal:id}).strict()
+const bundlePayload=z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,attemptNumber:z.number().int().positive(),generation:z.number().int().nonnegative(),runtimePrincipal:id,proofMode:z.enum(['ed25519','catsco-message']).optional(),proofKeyId:id.optional(),proofPublicKey:id.optional(),leaseExpiresAt:z.string().datetime(),workBundle:z.object({contractDigest:hash,instructions:id,deliverables:z.array(id)}).strict(),attemptRoute:attemptRoute.optional(),...contracts}).strict()
 export const bundle=z.object({...base,type:z.literal('work_bundle_proposed'),payload:bundlePayload}).strict()
+export const workerReady=z.object({...base,type:z.literal('worker_ready'),payload:z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,signature:z.literal('catsco-message-attested')}).strict()}).strict()
 export const runtimeStarted=z.object({...base,type:z.literal('runtime_started'),payload:z.object({workItemId:id,expectedRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,signature:z.literal('catsco-message-attested')}).strict()}).strict()
+const attemptTopicId=z.string().regex(/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/, 'targetTopicId must be a CatsCo Attempt topic')
+/** Worker-local submission envelope. targetTopicId is transport metadata and is never sent as part of the event. */
+export const workerReadySubmission=z.object({targetTopicId:attemptTopicId,event:workerReady}).strict().superRefine((submission, context)=>{
+  const payload=submission.event.payload
+  if(submission.event.entityRef!==`attempt:${payload.attemptId}`) context.addIssue({code:'custom',path:['event','entityRef'],message:'worker_ready entityRef must bind its attemptId'})
+  if(submission.event.source!==payload.runtimePrincipal) context.addIssue({code:'custom',path:['event','source'],message:'worker_ready source must match runtimePrincipal'})
+})
+export const runtimeStartedSubmission=z.object({targetTopicId:attemptTopicId,event:runtimeStarted}).strict().superRefine((submission, context)=>{
+  const payload=submission.event.payload
+  if(submission.event.entityRef!==`attempt:${payload.attemptId}`) context.addIssue({code:'custom',path:['event','entityRef'],message:'runtime_started entityRef must bind its attemptId'})
+  if(submission.event.source!==payload.runtimePrincipal) context.addIssue({code:'custom',path:['event','source'],message:'runtime_started source must match runtimePrincipal'})
+})
 export const candidate=z.object({...base,type:z.literal('candidate_submitted'),payload:z.object({ownerUid:id,workItemId:id,workItemRevision:z.number().int().positive(),attemptId:id,generation:z.number().int().nonnegative(),runtimePrincipal:id,candidateId:id,deliverable,...contracts,proofMode:z.enum(['ed25519','catsco-message']).optional(),signature:id.optional()}).strict()}).strict().superRefine((event,context)=>{
   if((event.payload.proofMode??'ed25519')==='catsco-message'&&!/^catsco-user:[1-9]\d*$/.test(event.payload.runtimePrincipal)) context.addIssue({code:'custom',path:['payload','runtimePrincipal'],message:'CatsCo-message Candidate requires a numeric CatsCo runtime principal'})
 })
-const attemptTopicId=z.string().regex(/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/, 'targetTopicId must be a CatsCo Attempt topic')
-/** Worker-local submission envelope. targetTopicId is transport metadata and is never sent as part of the event. */
 export const candidateSubmission=z.object({targetTopicId:attemptTopicId,event:candidate}).strict().superRefine((submission, context)=>{
   const payload=submission.event.payload
   if(submission.event.entityRef!==`attempt:${payload.attemptId}`) context.addIssue({code:'custom',path:['event','entityRef'],message:'Candidate entityRef must bind its attemptId'})
   if(submission.event.source!==payload.runtimePrincipal) context.addIssue({code:'custom',path:['event','source'],message:'Candidate source must match runtimePrincipal'})
 })
 export const review=z.object({...base,type:z.literal('review_decided'),payload:z.object({workItemId:id,expectedRevision:z.number().int().positive(),candidateId:id,outcome:z.enum(['accepted','changes_requested']),reviewerPrincipal:id,authenticationRef:id.optional(),reviewerProof:id.optional(),reviewedHeadSha:id,reviewedDeliverableDigest:hash,acceptanceContractHash:hash}).strict()}).strict()
+export const reviewSubmission=z.object({targetTopicId:attemptTopicId,event:review}).strict().superRefine((submission, context)=>{
+  const payload=submission.event.payload
+  if(submission.event.entityRef!==`work_item:${payload.workItemId}`) context.addIssue({code:'custom',path:['event','entityRef'],message:'Review entityRef must bind its workItemId'})
+  if(submission.event.source!==payload.reviewerPrincipal) context.addIssue({code:'custom',path:['event','source'],message:'Review source must match reviewerPrincipal'})
+})
 export const planEvent=z.union([registered,bundle])
-export type LoopEvent= z.infer<typeof registered>|z.infer<typeof bundle>|z.infer<typeof runtimeStarted>|z.infer<typeof candidate>|z.infer<typeof review>
+export type LoopEvent= z.infer<typeof registered>|z.infer<typeof bundle>|z.infer<typeof workerReady>|z.infer<typeof runtimeStarted>|z.infer<typeof candidate>|z.infer<typeof review>
 const canonical=(value:unknown):unknown=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.entries(value as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,canonical(v)])):value
 export function canonicalJson(value:unknown):string{return JSON.stringify(canonical(value))}
 const integrationInputs=z.object({workItemId:id,candidateId:id,repository:id,prNumber:z.number().int().positive(),headSha:id,digest:hash}).strict()
@@ -83,6 +100,36 @@ export function parseFanout(raw:string){
   }
   return parsed
 }
+export function parseAgentTaskStart(raw:string){
+  let value: unknown
+  try { value=JSON.parse(raw) } catch { throw new Error('agent-task start file is not valid JSON') }
+  if(!Array.isArray(value)||value.length!==2) throw new Error('agent-task start file must contain exactly one registration/bundle pair')
+  const registration=registered.parse(value[0])
+  const proposed=bundle.parse(value[1])
+  const r=registration.payload, b=proposed.payload
+  if(r.workItemId!==b.workItemId||b.expectedRevision!==1) throw new Error('agent-task start pair identity or revision mismatch')
+  for(const key of ['taskContractHash','referenceSnapshotHash','writeScopeHash','acceptanceContractHash'] as const) if(r[key]!==b[key]) throw new Error(`plan contract mismatch: ${key}`)
+  const worker=/^agent-task:([1-9]\d*)$/.exec(r.workerTopicId)
+  const evidence=/^evidence-topic:([1-9]\d*):([1-9]\d*)$/.exec(r.evidenceTopicId??'')
+  const review=/^review-topic:([1-9]\d*)$/.exec(r.stewardTopicId)
+  if(!worker||!evidence||!review) throw new Error('agent-task start requires workerTopicId agent-task:<WorkerUid>, evidenceTopicId evidence-topic:<WorkerUid>:<ReviewUid>, and stewardTopicId review-topic:<ReviewUid>')
+  if(evidence[1]!==worker[1]||review[1]!==evidence[2]) throw new Error('agent-task start placeholders must bind the same Worker and Review principals')
+  if(b.runtimePrincipal!==`catsco-user:${worker[1]}`) throw new Error('agent-task start runtime principal does not match Worker UID')
+  if(r.stewardPrincipal!==`catsco-user:${review[1]}`) throw new Error('agent-task start steward principal does not match Review UID')
+  if(r.catscoProjectId!=='project:auto'&&!/^[1-9]\d*$/.test(r.catscoProjectId)) throw new Error('agent-task start catscoProjectId must be numeric or project:auto')
+  if(new Set([r.workerTopicId,r.evidenceTopicId,r.stewardTopicId]).size!==3) throw new Error('agent-task start topics must be distinct')
+  const marker='LOOP_WORKTREE_CONTRACT_V1='
+  const worktreeLines=b.workBundle.instructions.split('\n').filter(line=>line.startsWith(marker))
+  if(worktreeLines.length!==1) throw new Error('agent-task start requires exactly one LOOP_WORKTREE_CONTRACT_V1 line')
+  let worktree: z.infer<typeof worktreeContract>
+  try { worktree=worktreeContract.parse(JSON.parse(worktreeLines[0].slice(marker.length))) } catch { throw new Error('agent-task start worktree contract is invalid') }
+  if(!worktree.gitDir) throw new Error('agent-task start worktree contract requires gitDir for workspace-prepare')
+  if(!posix.isAbsolute(worktree.worktreePath)||posix.normalize(worktree.worktreePath)!==worktree.worktreePath||!posix.isAbsolute(worktree.gitDir)||posix.normalize(worktree.gitDir)!==worktree.gitDir) {
+    throw new Error('agent-task start worktreePath and gitDir must be normalized absolute paths')
+  }
+  return { registration, bundle: proposed, workerAgentUid: worker[1], reviewAgentUid: review[1] }
+}
+
 export function parseAgentTaskFanout(raw:string){
   let value: unknown
   try { value=JSON.parse(raw) } catch { throw new Error('agent-task fanout file is not valid JSON') }
@@ -109,6 +156,10 @@ export function parsePlan(raw:string){
   if(b.expectedRevision!==1) throw new Error('new plan bundle expectedRevision must be 1')
   for(const key of ['taskContractHash','referenceSnapshotHash','writeScopeHash','acceptanceContractHash'] as const) if(r[key]!==b[key]) throw new Error(`plan contract mismatch: ${key}`)
   if(!r.workerTopicId||!r.stewardTopicId||r.workerTopicId===r.stewardTopicId) throw new Error('plan requires distinct worker and steward topics')
+  if(r.evidenceTopicId!==undefined) {
+    if(!/^grp_[1-9]\d*$/.test(r.evidenceTopicId)) throw new Error('evidenceTopicId must be a CatsCo group topic')
+    if(new Set([r.workerTopicId,r.evidenceTopicId,r.stewardTopicId]).size!==3) throw new Error('plan requires distinct worker, evidence, and steward topics')
+  }
   const numericCatscoPrincipal=/^catsco-user:[1-9]\d*$/
   if(r.stewardTopicId.startsWith('grp_')&&(!r.stewardPrincipal||!numericCatscoPrincipal.test(r.stewardPrincipal))) throw new Error('group Steward topic requires a numeric CatsCo principal')
   if(r.stewardPrincipal!==undefined&&!r.stewardPrincipal.startsWith('catsco-user:')) throw new Error('plan stewardPrincipal must be a CatsCo principal')

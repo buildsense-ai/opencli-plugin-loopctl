@@ -13,26 +13,36 @@ opencli loop pending
 opencli loop packet ACTION_ID
 opencli loop start --plan-file plans/first.json
 opencli loop fanout --plan-file plans/parallel.json
+opencli loop agent-task-start --plan-file plans/single-agent-task.json
 opencli loop agent-task-fanout --plan-file plans/parallel-agent-tasks.json
 opencli loop integrate --plan-file plans/integration.json
 opencli loop bundle --event-file plans/retry-generation-2.json
+opencli loop readiness-submit --event-file events/worker-ready-submission.json
 opencli loop runtime-started --event-file events/runtime-started.json
+opencli loop runtime-start-submit --event-file events/runtime-start-submission.json
+opencli loop workspace-prepare --packet-file packets/execute-attempt.json
 opencli loop candidate --event-file events/candidate.json
 opencli loop review --event-file events/review.json
+opencli loop review-submit --event-file events/review-submission.json
+opencli loop agent-task-retry --packet-file packets/recover-attempt.json --event-file events/retry-bundle.json
 opencli loop next --plan-next-action-id ACTION_ID --plan-file plans/next.json
 ```
 
-The eleven commands are available to the explicit Loop mode:
+The explicit Loop commands are available in Loop mode:
 
 - `status [--work-item ID]` — delegate to `loopctl status`.
 - `pending` — list ready Actions and current Work Items.
 - `packet ACTION_ID` — read the complete, current Agent packet.
 - `start --plan-file FILE` — ingest registration and bundle, then tick. The plan must contain exactly those two existing-schema events.
 - `fanout --plan-file FILE` — validate and ingest two or more independent registration/bundle pairs under one `loopId`, requiring unique Work Item IDs, Attempt IDs, branches, and worktree paths, then tick once to dispatch ready Actions. Use it only when each Worker Topic is already isolated.
-- `agent-task-fanout --plan-file FILE` — provision and topology-verify one CatsCo `agent_task` conversation per registration before any event is ingested. Every registration must share `catscoProjectId: "project:auto"` (or one existing numeric Project ID) and declare `workerTopicId: "agent-task:<WorkerAgentUid>"`; the command creates/reuses the owner-scoped `Loop <loopId>` Project, attaches and reads back every new `grp_<id>` topic from that Project, verifies that each group contains exactly that Agent, then registers and dispatches the whole fan-out.
+- `agent-task-start --plan-file FILE` — the required single-item path for new isolated Attempts. It journals and provisions a Project-bound execution `agent_task`, quiet evidence Topic, and Review Topic; topology and Project membership are verified before registration/bundle ingestion. A failure leaves an inspectable journal and does not dispatch a half-provisioned Attempt.
+- `agent-task-fanout --plan-file FILE` — legacy parallel provisioning. Do not use it for new evidence-lane Attempts until it provisions a separate evidence/review lane per item.
 - `integrate --plan-file FILE` — require immutable Candidate/PR inputs, verify each input Work Item is accepted/closed and its Candidate exists, then register and dispatch one integration Work Item.
 - `bundle --event-file FILE` — ingest a higher-generation bundle after `changes_requested`, then tick.
-- `runtime-started`, `candidate`, and `review` — validate and canonicalize existing-schema event JSON for an Agent to send verbatim; they never ingest locally.
+- `workspace-prepare --packet-file FILE` — Worker-only exact worktree creator/verifier; it checks base SHA, branch, normalized path, Git worktree registration, and workspace lease before repository work.
+- `runtime-started`, `candidate`, and `review` — validate and canonicalize existing-schema event JSON for an Agent to use in its transport envelope; they never ingest locally.
+- `readiness-submit`, `runtime-start-submit`, `candidate-submit`, and `review-submit` — receipt-verified transport commands. They send exact canonical event JSON to the declared quiet evidence Topic and require a matching server-confirmed receipt.
+- `agent-task-retry --packet-file FILE --event-file FILE` — provision fresh execution/evidence/review Topics for a fenced `recover_attempt` and submit its next-generation routed bundle.
 - `next --plan-next-action-id ACTION_ID --plan-file FILE` — validate the current `plan_next` packet, verify the new plan has the same `loopId` and a new Work Item ID, then ingest registration and bundle and tick.
 
 ## Review and Worker flow
@@ -47,11 +57,11 @@ Review uses its current private topic as `stewardTopicId` by default. A Worker P
 
 Fallback for multiple human supervisors: Review may explicitly use an existing multi-member `grp_*` conversation as `stewardTopicId`. In that mode, a human must structurally mention Review; visible `@name` text is not a wake signal. This changes only Review's human interaction surface. It must never be reused as an Attempt execution group.
 
-In explicit Loop mode, Review first runs `opencli catsco agents --format json` and selects an available Worker. If none is eligible, Review stops before creating a Work Item and asks the task author to provide a CatsCo Agent UID. Adding that Agent means establishing a friend relationship: Review uses `opencli catsco friend-request AGENT_UID --message "Loop Worker access requested"`, waits for acceptance, then refreshes `catsco agents` before proceeding. It never asks for credentials or creates a Bot as a substitute. Once an eligible Worker is available, Review creates a complete plan and runs `opencli loop start` for one non-parallel Attempt; it does not ask the human for Kernel events. For independent parallel work, Review uses `opencli loop agent-task-fanout`, which provisions one unique Agent Task topic per Attempt before dispatch. Each bundle carries a `LOOP_WORKTREE_CONTRACT_V1` instruction with a unique branch, worktree path, base revision, cleanup policy, and workspace lease. After all required Candidates are accepted, Review uses `opencli loop integrate`; the command fails closed unless every declared Candidate input is present behind an accepted/closed Work Item. Controller sends `execute_attempt` to each Attempt's dedicated Worker Agent Task topic with `mentions:["usr<worker-uid>"]`. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
+In explicit Loop mode, Review first runs `opencli catsco agents --format json` and selects an available Worker. If none is eligible, Review stops before creating a Work Item and asks the task author to provide a CatsCo Agent UID. Adding that Agent means establishing a friend relationship: Review uses `opencli catsco friend-request AGENT_UID --message "Loop Worker access requested"`, waits for acceptance, then refreshes `catsco agents` before proceeding. It never asks for credentials or creates a Bot as a substitute. Once an eligible Worker is available, Review creates a complete single-item plan and runs `opencli loop agent-task-start`; it does not ask the human for Kernel events. The command provisions one unique execution Topic, quiet evidence Topic, and Review Topic before dispatch. Each bundle carries a `LOOP_WORKTREE_CONTRACT_V1` instruction with a unique branch, worktree path, `gitDir`, base revision, cleanup policy, and workspace lease. After all required Candidates are accepted, Review uses `opencli loop integrate`; the command fails closed unless every declared Candidate input is present behind an accepted/closed Work Item. Controller sends `execute_attempt` to each Attempt's dedicated Worker Agent Task topic with `mentions:["usr<worker-uid>"]`. If the explicitly selected Steward topic is a group, Controller derives `mentions:["usr<review-uid>"]` for `review_candidate` and `plan_next`, so only Review wakes in that group. Packet content and protocol events remain unchanged.
 
-Review inspects `review_candidate` packets with Bash, `gh`, and tests, then sends the exact output of `opencli loop review` as its CatsCo reply.
+Review inspects `review_candidate` packets with Bash, `gh`, and tests, then submits a relative `review-submit` envelope to the evidence Topic; a normal CatsCo reply is not review evidence.
 
-The Worker accepts only an `execute_attempt` packet. It sends the exact `runtime-started` output first through the existing CatsCo reply capability, performs bounded Bash/Git/`gh` work within the packet's contracts, scope, and lease, and sends the exact Candidate output afterward.
+The Worker accepts `preflight_attempt` and `execute_attempt` packets. Preflight only proves OpenCLI/CatsCo readiness through `readiness-submit`; it cannot touch the repository. On execution, it first runs `workspace-prepare`, starts through `runtime-start-submit`, and completes through `candidate-submit`; all transport commands target the quiet evidence Topic and require a CatsCo server receipt rather than relying on a wrapped tool transcript. It performs bounded Bash/Git/`gh` work within the packet's contracts, scope, and lease.
 
 A `changes_requested` review leaves the Work Item in `changes_requested`; after the Controller commits it, Review creates generation+1 and runs `opencli loop bundle`. An accepted/closed review creates exactly one `plan_next` Action. Review uses that packet with `opencli loop next` for another Work Item in the same loop, or reports completion to the human when no next Work Item exists. There is no fake `loop_completed` event, and task status or PR existence is not completion evidence.
 

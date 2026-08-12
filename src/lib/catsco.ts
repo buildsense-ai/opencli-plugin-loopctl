@@ -16,6 +16,14 @@ export interface AgentTaskTopic {
   agentIds: string
 }
 
+export interface StandardTopic {
+  groupId: string
+  topic: string
+  kind: 'standard' | 'agent_task'
+  agentIds: string
+  memberIds: string
+}
+
 export interface CatscoSendReceipt {
   messageId: string
   topicId: string
@@ -31,10 +39,14 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return row as Record<string, unknown>
 }
 
-export async function sendAttemptEvent(topicId: string, content: string, clientMsgId: string): Promise<CatscoSendReceipt> {
-  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError('Candidate targetTopicId must be a CatsCo Attempt topic')
-  if (!clientMsgId.trim()) throw new CommandExecutionError('Candidate idempotencyKey is required')
-  const sent = asRecord(await runOpenCli(['catsco', 'send', topicId, content, '--client-message-id', clientMsgId, '--format', 'json']), 'Candidate send')
+export async function sendAttemptEvent(topicId: string, content: string, clientMsgId: string, expectedPrincipal: string): Promise<CatscoSendReceipt> {
+  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError('attested event targetTopicId must be a CatsCo Attempt topic')
+  if (!clientMsgId.trim()) throw new CommandExecutionError('attested event idempotencyKey is required')
+  const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1]
+  if (!expectedUid) throw new CommandExecutionError('attested event source must be a numeric CatsCo principal')
+  const authenticatedUid = await currentCatscoUid()
+  if (authenticatedUid !== expectedUid) throw new CommandExecutionError('CatsCo authenticated sender does not match attested event source')
+  const sent = asRecord(await runOpenCli(['catsco', 'send', topicId, content, '--client-message-id', clientMsgId, '--format', 'json']), 'attested event send')
   const receipt = {
     messageId: String(sent.messageId ?? ''),
     topicId: String(sent.topicId ?? ''),
@@ -44,11 +56,11 @@ export async function sendAttemptEvent(topicId: string, content: string, clientM
     contentDigest: String(sent.contentDigest ?? '')
   }
   if (!receipt.messageId || !receipt.seqId || receipt.topicId !== topicId || receipt.clientMsgId !== clientMsgId || !receipt.contentDigest) {
-    throw new CommandExecutionError('CatsCo Candidate send receipt failed verification')
+    throw new CommandExecutionError('CatsCo attested event send receipt failed verification')
   }
-  const confirmed = asRecord(await runOpenCli(['catsco', 'message-receipt', topicId, '--client-message-id', clientMsgId, '--format', 'json']), 'Candidate receipt')
+  const confirmed = asRecord(await runOpenCli(['catsco', 'message-receipt', topicId, '--client-message-id', clientMsgId, '--format', 'json']), 'attested event receipt')
   if (confirmed.found !== true || confirmed.serverConfirmed !== true || String(confirmed.topicId ?? '') !== topicId || String(confirmed.clientMsgId ?? '') !== clientMsgId || String(confirmed.seqId ?? '') !== receipt.seqId || String(confirmed.contentDigest ?? '') !== receipt.contentDigest) {
-    throw new CommandExecutionError('CatsCo Candidate receipt was not server-confirmed')
+    throw new CommandExecutionError('CatsCo attested event receipt was not server-confirmed')
   }
   return receipt
 }
@@ -72,7 +84,49 @@ async function runOpenCli(args: string[]): Promise<unknown> {
   })
 }
 
+async function currentCatscoUid(): Promise<string> {
+  const row = asRecord(await runOpenCli(['catsco', 'me', '--format', 'json']), 'identity')
+  const uid = String(row.uid ?? '')
+  if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError('CatsCo identity response has no numeric uid')
+  return uid
+}
+
+function csv(value: unknown): string[] {
+  return String(value ?? '').split(',').map(item => item.trim()).filter(Boolean)
+}
+
+async function groupInfo(groupId: string): Promise<StandardTopic> {
+  const row = asRecord(await runOpenCli(['catsco', 'group-info', groupId, '--format', 'json']), 'group topology')
+  const returnedGroupId = String(row.groupId ?? '')
+  const topic = String(row.topic ?? '')
+  const kind = String(row.kind ?? '')
+  const agentIds = csv(row.agentIds).sort()
+  const memberIds = csv(row.memberIds).sort()
+  if (returnedGroupId !== groupId || topic !== `grp_${groupId}` || (kind !== 'standard' && kind !== 'agent_task')) {
+    throw new CommandExecutionError('CatsCo group topology response did not bind the requested group')
+  }
+  return { groupId: returnedGroupId, topic, kind: kind as 'standard' | 'agent_task', agentIds: agentIds.join(','), memberIds: memberIds.join(',') }
+}
+
+export async function createStandardTopic(name: string, agentUids: string[]): Promise<StandardTopic> {
+  const ownerUid = await currentCatscoUid()
+  const expected = [...new Set(agentUids)].sort()
+  if (!name || name.length > 180 || expected.length === 0 || expected.some(uid => !/^[1-9]\d*$/.test(uid))) {
+    throw new CommandExecutionError('standard evidence/review topic request is invalid')
+  }
+  const created = asRecord(await runOpenCli(['catsco', 'group-create', name, expected.join(','), '--kind', 'standard', '--format', 'json']), 'standard topic provisioning')
+  const groupId = String(created.groupId ?? created.group_id ?? '')
+  if (!/^[1-9]\d*$/.test(groupId)) throw new CommandExecutionError('CatsCo standard topic provisioning returned an invalid group id')
+  const topology = await groupInfo(groupId)
+  if (topology.kind !== 'standard' || topology.agentIds.split(',').filter(Boolean).sort().join(',') !== expected.join(',') ||
+    !topology.memberIds.split(',').filter(Boolean).includes(ownerUid)) {
+    throw new CommandExecutionError('CatsCo standard topic topology failed verification')
+  }
+  return { ...topology, kind: 'standard' }
+}
+
 export async function createAgentTaskTopic(name: string, workerAgentUid: string): Promise<AgentTaskTopic> {
+  const ownerUid = await currentCatscoUid()
   if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError('agent-task Worker UID must be numeric')
   if (!name || name.length > 180) throw new CommandExecutionError('agent-task name is invalid')
   const value = await runOpenCli(['catsco', 'group-create', name, workerAgentUid, '--kind', 'agent_task', '--format', 'json'])
@@ -86,6 +140,10 @@ export async function createAgentTaskTopic(name: string, workerAgentUid: string)
   const actualIds = agentIds.split(',').map(value => value.trim()).filter(Boolean)
   if (!/^[1-9]\d*$/.test(groupId) || !/^grp_[1-9]\d*$/.test(topic) || kind !== 'agent_task' || actualIds.length !== 1 || actualIds[0] !== workerAgentUid) {
     throw new CommandExecutionError('CatsCo agent-task provisioning response failed topology verification')
+  }
+  const topology = await groupInfo(groupId)
+  if (topology.kind !== 'agent_task' || topology.agentIds !== workerAgentUid || !topology.memberIds.split(',').filter(Boolean).includes(ownerUid)) {
+    throw new CommandExecutionError('CatsCo agent-task topology failed verification')
   }
   return { groupId, topic, kind: 'agent_task', agentIds }
 }

@@ -115,18 +115,25 @@ async function groupInfo(groupId: string): Promise<StandardTopic> {
   return { groupId: returnedGroupId, topic, kind: kind as 'standard' | 'agent_task', agentIds: agentIds.join(','), memberIds: memberIds.join(',') }
 }
 
-export async function createStandardTopic(name: string, agentUids: string[]): Promise<StandardTopic> {
+export async function createStandardTopic(name: string, memberUids: string[]): Promise<StandardTopic> {
   const ownerUid = await currentCatscoUid()
-  const expected = [...new Set(agentUids)].sort()
-  if (!name || name.length > 180 || expected.length === 0 || expected.some(uid => !/^[1-9]\d*$/.test(uid))) {
+  const requestedMemberUids = [...new Set(memberUids)].sort()
+  // CatsCo returns human participants only in memberIds. The authenticated owner
+  // is therefore a member but not an agentIds entry when it is also a requested
+  // coordinator/reviewer. Keep the complete member set separate from Agent IDs.
+  const expectedMemberIds = [...new Set([ownerUid, ...requestedMemberUids])].sort()
+  const expectedAgentIds = requestedMemberUids.filter(uid => uid !== ownerUid)
+  if (!name || name.length > 180 || requestedMemberUids.length === 0 || requestedMemberUids.some(uid => !/^[1-9]\d*$/.test(uid))) {
     throw new CommandExecutionError('standard evidence/review topic request is invalid')
   }
-  const created = asRecord(await runOpenCli(['catsco', 'group-create', name, expected.join(','), '--kind', 'standard', '--format', 'json']), 'standard topic provisioning')
+  const created = asRecord(await runOpenCli(['catsco', 'group-create', name, requestedMemberUids.join(','), '--kind', 'standard', '--format', 'json']), 'standard topic provisioning')
   const groupId = String(created.groupId ?? created.group_id ?? '')
   if (!/^[1-9]\d*$/.test(groupId)) throw new CommandExecutionError('CatsCo standard topic provisioning returned an invalid group id')
   const topology = await groupInfo(groupId)
-  if (topology.kind !== 'standard' || topology.agentIds.split(',').filter(Boolean).sort().join(',') !== expected.join(',') ||
-    !topology.memberIds.split(',').filter(Boolean).includes(ownerUid)) {
+  const actualAgentIds = topology.agentIds.split(',').filter(Boolean).sort()
+  const actualMemberIds = topology.memberIds.split(',').filter(Boolean).sort()
+  if (topology.kind !== 'standard' || actualAgentIds.join(',') !== expectedAgentIds.join(',') ||
+    actualMemberIds.join(',') !== expectedMemberIds.join(',')) {
     throw new CommandExecutionError('CatsCo standard topic topology failed verification')
   }
   return { ...topology, kind: 'standard' }

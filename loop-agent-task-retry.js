@@ -263,17 +263,21 @@ async function groupInfo(groupId) {
   }
   return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
 }
-async function createStandardTopic(name, agentUids) {
+async function createStandardTopic(name, memberUids) {
   const ownerUid = await currentCatscoUid();
-  const expected = [...new Set(agentUids)].sort();
-  if (!name || name.length > 180 || expected.length === 0 || expected.some((uid) => !/^[1-9]\d*$/.test(uid))) {
+  const requestedMemberUids = [...new Set(memberUids)].sort();
+  const expectedMemberIds = [.../* @__PURE__ */ new Set([ownerUid, ...requestedMemberUids])].sort();
+  const expectedAgentIds = requestedMemberUids.filter((uid) => uid !== ownerUid);
+  if (!name || name.length > 180 || requestedMemberUids.length === 0 || requestedMemberUids.some((uid) => !/^[1-9]\d*$/.test(uid))) {
     throw new CommandExecutionError2("standard evidence/review topic request is invalid");
   }
-  const created = asRecord(await runOpenCli(["catsco", "group-create", name, expected.join(","), "--kind", "standard", "--format", "json"]), "standard topic provisioning");
+  const created = asRecord(await runOpenCli(["catsco", "group-create", name, requestedMemberUids.join(","), "--kind", "standard", "--format", "json"]), "standard topic provisioning");
   const groupId = String(created.groupId ?? created.group_id ?? "");
   if (!/^[1-9]\d*$/.test(groupId)) throw new CommandExecutionError2("CatsCo standard topic provisioning returned an invalid group id");
   const topology = await groupInfo(groupId);
-  if (topology.kind !== "standard" || topology.agentIds.split(",").filter(Boolean).sort().join(",") !== expected.join(",") || !topology.memberIds.split(",").filter(Boolean).includes(ownerUid)) {
+  const actualAgentIds = topology.agentIds.split(",").filter(Boolean).sort();
+  const actualMemberIds = topology.memberIds.split(",").filter(Boolean).sort();
+  if (topology.kind !== "standard" || actualAgentIds.join(",") !== expectedAgentIds.join(",") || actualMemberIds.join(",") !== expectedMemberIds.join(",")) {
     throw new CommandExecutionError2("CatsCo standard topic topology failed verification");
   }
   return { ...topology, kind: "standard" };

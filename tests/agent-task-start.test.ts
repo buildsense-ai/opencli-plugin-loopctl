@@ -70,8 +70,8 @@ if(args[0]!=='catsco') process.exit(2);
 if(args[1]==='me') output({uid:'602'});
 else if(args[1]==='projects') output([]);
 else if(args[1]==='project-create') output({id:'41'});
-else if(args[1]==='group-create') { const id=String(state.next++); const members=args[3]; const kind=args[args.indexOf('--kind')+1]; state.groups[id]={members,kind}; fs.writeFileSync(statePath,JSON.stringify(state)); output({groupId:id,topic:'grp_'+id,kind,agentIds:members}); }
-else if(args[1]==='group-info') { const id=args[2]; const group=state.groups[id]; output({groupId:id,topic:'grp_'+id,kind:group.kind,agentIds:group.members,memberIds:'602,'+group.members}); }
+else if(args[1]==='group-create') { const id=String(state.next++); const members=args[3]; const kind=args[args.indexOf('--kind')+1]; const agentIds=members.split(',').filter(id=>id!=='602').join(','); state.groups[id]={members,kind,agentIds}; fs.writeFileSync(statePath,JSON.stringify(state)); output({groupId:id,topic:'grp_'+id,kind,agentIds}); }
+else if(args[1]==='group-info') { const id=args[2]; const group=state.groups[id]; const memberIds=['602',...group.members.split(',')].filter((value,index,values)=>values.indexOf(value)===index).join(','); output({groupId:id,topic:'grp_'+id,kind:group.kind,agentIds:group.agentIds,memberIds}); }
 else if(args[1]==='project-assign-topic') { if(process.env.FAIL_ASSIGN==='1') { process.stderr.write('assignment denied'); process.exit(1); } output({projectId:args[2],topicId:args[3],assigned:true}); }
 else if(args[1]==='project-sessions') output(Object.keys(state.groups).filter(id=>process.env.OMIT_ASSIGNED_TOPIC!=='1').map(id=>({topicId:'grp_'+id})));
 else { process.stderr.write('unsupported '+args.slice(0,2).join(' ')); process.exit(1); }
@@ -124,6 +124,28 @@ describe('single-item agent task provisioning', () => {
       coordinatorSessionId: 'session:v2:catscompany:group:grp_101:agent:574',
       workerTopicId: 'grp_102', evidenceTopicId: 'grp_103', stewardTopicId: 'grp_104'
     })
+  }, 30_000)
+
+  it('accepts the deployed owner-and-Worker standard group topology', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-task-start-owner-topology-')); roots.push(root)
+    installBinaries(root)
+    const ownerReviewPlan: any[] = plan()
+    ownerReviewPlan[0].payload.evidenceTopicId = 'evidence-topic:559:602'
+    ownerReviewPlan[0].payload.stewardTopicId = 'review-topic:602'
+    ownerReviewPlan[0].payload.stewardPrincipal = 'catsco-user:602'
+    writeFileSync(join(root, 'plan.json'), JSON.stringify(ownerReviewPlan))
+    const cwd = process.cwd(); process.chdir(root)
+    try {
+      const result = await agentTaskStart({ 'plan-file': 'plan.json' })
+      expect(result.provisionedTopics).toMatchObject({
+        coordinatorTopic: { kind: 'standard', agentIds: '', memberIds: '602' },
+        workerTopic: { kind: 'agent_task', agentIds: '559' },
+        evidenceTopic: { kind: 'standard', agentIds: '559', memberIds: '559,602' },
+        reviewTopic: { kind: 'standard', agentIds: '', memberIds: '602' }
+      })
+      const journal = JSON.parse(readFileSync(result.journalPath, 'utf8'))
+      expect(journal).toMatchObject({ phase: 'completed', projectId: '41' })
+    } finally { process.chdir(cwd) }
   }, 30_000)
 
   it('rejects a caller-provided historical P2P bundle route before provisioning', async () => {

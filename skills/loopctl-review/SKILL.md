@@ -67,5 +67,6 @@ Controller sends `execute_attempt` to the Attempt's dedicated Agent Task topic (
 - After `changes_requested`, wait for the Controller commit, then create generation+1 `work_bundle_proposed` and run `opencli loop bundle --event-file FILE` only if the existing Attempt route remains valid; otherwise use `agent-task-retry`.
 - For accepted/closed `plan_next`, use the packet to decide the next Work Item in the same loopId. Run `opencli loop next --plan-file FILE`; if there is no next Work Item, report completion to the human. Do not invent a `loop_completed` event.
 - Do not treat task status or PR existence as completion. Kernel receipts and review acceptance are authoritative.
+- A Worker `loop_compat_result_v1` final response is informational only. Never treat it as a substitute for the receipt-attested Candidate submission or normal PR review and inspection.
 
 See `examples/` for placeholder-only fixtures. Never request or include credentials, production IDs, or secrets.

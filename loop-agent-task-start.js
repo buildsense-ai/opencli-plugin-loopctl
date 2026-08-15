@@ -266,6 +266,12 @@ function asRecord(value, label) {
   if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2(`CatsCo ${label} returned a non-object`);
   return row2;
 }
+function asIdentityRecord(value) {
+  const identity = unwrap2(value);
+  const row2 = Array.isArray(identity) && identity.length === 1 ? identity[0] : identity;
+  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo identity returned an invalid response");
+  return row2;
+}
 async function runOpenCli(args) {
   return await new Promise((resolve3, reject) => {
     const child = spawn2(process.env.OPENCLI_BINARY?.trim() || "opencli", args, { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
@@ -303,7 +309,7 @@ async function runOpenCli(args) {
   });
 }
 async function currentCatscoUid() {
-  const row2 = asRecord(await runOpenCli(["catsco", "me", "--format", "json"]), "identity");
+  const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
   const uid = String(row2.uid ?? "");
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
   return uid;

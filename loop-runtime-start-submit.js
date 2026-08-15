@@ -151,6 +151,12 @@ function asRecord(value, label) {
   if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2(`CatsCo ${label} returned a non-object`);
   return row2;
 }
+function asIdentityRecord(value) {
+  const identity = unwrap(value);
+  const row2 = Array.isArray(identity) && identity.length === 1 ? identity[0] : identity;
+  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo identity returned an invalid response");
+  return row2;
+}
 async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal) {
   if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError2("attested event targetTopicId must be a CatsCo Attempt topic");
   if (!clientMsgId.trim()) throw new CommandExecutionError2("attested event idempotencyKey is required");
@@ -213,7 +219,7 @@ async function runOpenCli(args) {
   });
 }
 async function currentCatscoUid() {
-  const row2 = asRecord(await runOpenCli(["catsco", "me", "--format", "json"]), "identity");
+  const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
   const uid = String(row2.uid ?? "");
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
   return uid;

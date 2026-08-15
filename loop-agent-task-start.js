@@ -119,7 +119,8 @@ function parseAgentTaskStart(raw) {
   const proposed = bundle.parse(value[1]);
   const r = registration.payload, b = proposed.payload;
   if (r.workItemId !== b.workItemId || b.expectedRevision !== 1) throw new Error("agent-task start pair identity or revision mismatch");
-  if (!r.coordinatorSessionId || !r.coordinatorSessionTopicId) throw new Error("agent-task start requires the Review coordinator session id and canonical topic id");
+  if (r.coordinatorSessionId !== void 0 || r.coordinatorSessionTopicId !== void 0) throw new Error("agent-task start provisions a new Project coordinator; do not supply coordinator session or topic fields");
+  if (b.attemptRoute !== void 0) throw new Error("agent-task start provisions its own Project routes; do not supply bundle attemptRoute");
   for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (r[key] !== b[key]) throw new Error(`plan contract mismatch: ${key}`);
   const worker = /^agent-task:([1-9]\d*)$/.exec(r.workerTopicId);
   const evidence = /^evidence-topic:([1-9]\d*):([1-9]\d*)$/.exec(r.evidenceTopicId ?? "");
@@ -128,7 +129,7 @@ function parseAgentTaskStart(raw) {
   if (evidence[1] !== worker[1] || review2[1] !== evidence[2]) throw new Error("agent-task start placeholders must bind the same Worker and Review principals");
   if (b.runtimePrincipal !== `catsco-user:${worker[1]}`) throw new Error("agent-task start runtime principal does not match Worker UID");
   if (r.stewardPrincipal !== `catsco-user:${review2[1]}`) throw new Error("agent-task start steward principal does not match Review UID");
-  if (r.catscoProjectId !== "project:auto" && !/^[1-9]\d*$/.test(r.catscoProjectId)) throw new Error("agent-task start catscoProjectId must be numeric or project:auto");
+  if (r.catscoProjectId !== "project:new") throw new Error("agent-task start catscoProjectId must be project:new; the command creates a fresh Project");
   if ((/* @__PURE__ */ new Set([r.workerTopicId, r.evidenceTopicId, r.stewardTopicId])).size !== 3) throw new Error("agent-task start topics must be distinct");
   const marker = "LOOP_WORKTREE_CONTRACT_V1=";
   const worktreeLines = b.workBundle.instructions.split("\n").filter((line) => line.startsWith(marker));
@@ -359,19 +360,13 @@ async function createAgentTaskTopic(name, workerAgentUid) {
   }
   return { groupId, topic, kind: "agent_task", agentIds };
 }
-async function resolveLoopProject(loopId, requestedProjectId) {
-  if (/^[1-9]\d*$/.test(requestedProjectId)) return requestedProjectId;
-  if (requestedProjectId !== "project:auto") throw new CommandExecutionError2("catscoProjectId must be numeric or project:auto");
-  const name = `Loop ${loopId}`;
-  const listed = unwrap2(await runOpenCli(["catsco", "projects", "--format", "json"]));
-  if (!Array.isArray(listed)) throw new CommandExecutionError2("CatsCo Projects returned invalid JSON");
-  const existing = listed.find((row2) => row2 && typeof row2 === "object" && String(row2.name ?? "") === name);
-  if (existing && /^[1-9]\d*$/.test(String(existing.id ?? ""))) return String(existing.id);
-  const created = unwrap2(await runOpenCli(["catsco", "project-create", name, "--format", "json"]));
-  if (!created || typeof created !== "object" || !/^[1-9]\d*$/.test(String(created.id ?? ""))) {
-    throw new CommandExecutionError2("CatsCo Project allocation returned an invalid Project id");
-  }
-  return String(created.id);
+async function createAttemptProject(loopId, attemptId) {
+  const name = `Loop ${loopId} ${attemptId}`;
+  if (!name || name.length > 180) throw new CommandExecutionError2("CatsCo Project name is invalid");
+  const created = asRecord(await runOpenCli(["catsco", "project-create", name, "--format", "json"]), "Project provisioning");
+  const projectId = String(created.id ?? created.projectId ?? created.project_id ?? "");
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project provisioning returned an invalid Project id");
+  return projectId;
 }
 async function attachTopicToProject(projectId, topic) {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
@@ -461,6 +456,60 @@ async function acquireExclusiveLock(path, label) {
 // src/lib/provisioning-journal.ts
 var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
+function numericIds(value) {
+  if (typeof value !== "string") return void 0;
+  const ids = value.split(",").map((id4) => id4.trim());
+  if (ids.length === 0 || ids.some((id4) => !/^[1-9]\d*$/.test(id4)) || new Set(ids).size !== ids.length) return void 0;
+  return ids.sort();
+}
+function isProvisionedTopicRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const topic = value;
+  const groupId = topic.groupId;
+  const topicId = topic.topic;
+  const kind = topic.kind;
+  return typeof groupId === "string" && typeof topicId === "string" && /^[1-9]\d*$/.test(groupId) && topicId === `grp_${groupId}` && (kind === "agent_task" || kind === "standard") && numericIds(topic.agentIds) !== void 0 && (topic.memberIds === void 0 || numericIds(topic.memberIds) !== void 0);
+}
+function hasExactAgents(topic, expected) {
+  const actual = numericIds(topic.agentIds);
+  return actual !== void 0 && actual.length === expected.length && actual.every((id4, index) => id4 === expected[index]);
+}
+function includesRoleMembers(topic, expected) {
+  const members = topic.memberIds === void 0 ? void 0 : numericIds(topic.memberIds);
+  return members === void 0 || expected.every((id4) => members.includes(id4));
+}
+function retryRolePrincipals(plan) {
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return void 0;
+  const value = plan;
+  const packet = value.packet;
+  const retry = value.retry;
+  if (!packet || typeof packet !== "object" || Array.isArray(packet) || !retry || typeof retry !== "object" || Array.isArray(retry)) return void 0;
+  const packetRecord = packet;
+  const retryRecord = retry;
+  const payload = retryRecord.payload;
+  if (packetRecord.kind !== "recover_attempt" || retryRecord.type !== "work_bundle_proposed" || !payload || typeof payload !== "object" || Array.isArray(payload)) return void 0;
+  const worker = /^catsco-user:([1-9]\d*)$/.exec(String(payload.runtimePrincipal ?? ""))?.[1];
+  const reviewer = /^catsco-user:([1-9]\d*)$/.exec(String(packetRecord.stewardPrincipal ?? ""))?.[1];
+  return worker && reviewer ? { worker, reviewer } : void 0;
+}
+function migrateLegacyRetryJournal(value, kind, id4, planDigest, plan) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("provisioning journal identity does not match the requested plan");
+  const legacy = value;
+  if (legacy.schema !== "loopctl-provision-journal-v1") throw new Error("provisioning journal identity does not match the requested plan");
+  if (kind !== "agent-task-retry") throw new Error("v1 agent-task-start journal cannot be resumed as a Project-owned coordinator invocation; create a new plan");
+  const principals = retryRolePrincipals(plan);
+  const workerTopic = legacy.workerTopic;
+  const evidenceTopic = legacy.evidenceTopic;
+  const reviewTopic = legacy.reviewTopic;
+  const workerAgents = principals ? [principals.worker] : [];
+  const evidenceAgents = principals ? [principals.worker, principals.reviewer].sort() : [];
+  const reviewAgents = principals ? [principals.reviewer] : [];
+  const topicIds = [workerTopic?.topic, evidenceTopic?.topic, reviewTopic?.topic];
+  if (legacy.kind !== kind || legacy.planDigest !== planDigest || legacy.id !== id4 || !Array.isArray(legacy.manualCleanupTopicIds) || !legacy.manualCleanupTopicIds.every((topic) => typeof topic === "string") || typeof legacy.projectId !== "string" || !/^[1-9]\d*$/.test(legacy.projectId) || !principals || !isProvisionedTopicRecord(workerTopic) || !isProvisionedTopicRecord(evidenceTopic) || !isProvisionedTopicRecord(reviewTopic) || workerTopic.kind !== "agent_task" || evidenceTopic.kind !== "standard" || reviewTopic.kind !== "standard" || new Set(topicIds).size !== topicIds.length || !hasExactAgents(workerTopic, workerAgents) || !hasExactAgents(evidenceTopic, evidenceAgents) || !hasExactAgents(reviewTopic, reviewAgents) || !includesRoleMembers(workerTopic, workerAgents) || !includesRoleMembers(evidenceTopic, evidenceAgents) || !includesRoleMembers(reviewTopic, reviewAgents)) {
+    throw new Error("v1 retry journal topology is incompatible with safe migration");
+  }
+  return { ...legacy, schema: "loopctl-provision-journal-v2" };
+}
 function directory() {
   return resolve2(process.env.LOOPCTL_PROVISION_JOURNAL_DIR?.trim() || join(homedir(), ".local", "state", "loopctl", "provisioning"));
 }
@@ -485,18 +534,21 @@ async function openProvisionJournal(kind, plan) {
   let journal;
   try {
     try {
-      journal = JSON.parse(await readFile2(path, "utf8"));
-      if (journal.schema !== "loopctl-provision-journal-v1" || journal.kind !== kind || journal.planDigest !== planDigest || journal.id !== id4) {
+      const existing = JSON.parse(await readFile2(path, "utf8"));
+      const isLegacy = !!existing && typeof existing === "object" && !Array.isArray(existing) && existing.schema === "loopctl-provision-journal-v1";
+      journal = isLegacy ? migrateLegacyRetryJournal(existing, kind, id4, planDigest, plan) : existing;
+      if (journal.schema !== "loopctl-provision-journal-v2" || journal.kind !== kind || journal.planDigest !== planDigest || journal.id !== id4) {
         throw new Error("provisioning journal identity does not match the requested plan");
       }
       if (journal.phase !== "validated" && journal.phase !== "failed") {
         throw new Error(`provisioning journal requires explicit recovery before resume: ${journal.phase}`);
       }
+      if (isLegacy) await persist(path, journal);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       const timestamp = now();
       journal = {
-        schema: "loopctl-provision-journal-v1",
+        schema: "loopctl-provision-journal-v2",
         id: id4,
         kind,
         planDigest,
@@ -571,8 +623,17 @@ async function agentTaskStart(kwargs) {
   });
   try {
     let journal = journalStore.journal();
-    const projectId = journal.projectId ?? await resolveLoopProject(parsed.registration.payload.loopId, parsed.registration.payload.catscoProjectId);
+    const projectId = journal.projectId ?? await createAttemptProject(parsed.registration.payload.loopId, parsed.bundle.payload.attemptId);
     if (!journal.projectId) journal = await journalStore.save({ phase: "project_resolved", projectId });
+    const coordinatorTopic = journal.coordinatorTopic ?? asRecord2(await createStandardTopic(
+      `Loop ${parsed.registration.payload.loopId} ${parsed.bundle.payload.attemptId} coordinator`,
+      [parsed.reviewAgentUid]
+    ));
+    if (!journal.coordinatorTopic) journal = await journalStore.save({
+      phase: "topics_created",
+      coordinatorTopic,
+      manualCleanupTopicIds: [...journal.manualCleanupTopicIds, coordinatorTopic.topic]
+    });
     const workerTopic = journal.workerTopic ?? asRecord2(await createAgentTaskTopic(
       `Loop ${parsed.registration.payload.loopId} ${parsed.bundle.payload.attemptId} execution`,
       parsed.workerAgentUid
@@ -600,10 +661,12 @@ async function agentTaskStart(kwargs) {
       reviewTopic,
       manualCleanupTopicIds: [...journal.manualCleanupTopicIds, reviewTopic.topic]
     });
+    await attachTopicToProject(projectId, coordinatorTopic.topic);
     await attachTopicToProject(projectId, workerTopic.topic);
     await attachTopicToProject(projectId, evidenceTopic.topic);
     await attachTopicToProject(projectId, reviewTopic.topic);
-    journal = await journalStore.save({ phase: "topics_attached", projectId, workerTopic, evidenceTopic, reviewTopic });
+    journal = await journalStore.save({ phase: "topics_attached", projectId, coordinatorTopic, workerTopic, evidenceTopic, reviewTopic });
+    const coordinatorSessionId = `session:v2:catscompany:group:${coordinatorTopic.topic}:agent:${parsed.reviewAgentUid}`;
     const registrationEvent = { ...parsed.registration, payload: {
       ...parsed.registration.payload,
       catscoProjectId: projectId,
@@ -611,8 +674,8 @@ async function agentTaskStart(kwargs) {
       evidenceTopicId: evidenceTopic.topic,
       stewardTopicId: reviewTopic.topic,
       stewardPrincipal: `catsco-user:${parsed.reviewAgentUid}`,
-      coordinatorSessionId: parsed.registration.payload.coordinatorSessionId,
-      coordinatorSessionTopicId: parsed.registration.payload.coordinatorSessionTopicId
+      coordinatorSessionId,
+      coordinatorSessionTopicId: coordinatorTopic.topic
     } };
     const routedBundle = { ...parsed.bundle, payload: { ...parsed.bundle.payload, attemptRoute: {
       catscoProjectId: projectId,
@@ -621,8 +684,8 @@ async function agentTaskStart(kwargs) {
       stewardTopicId: reviewTopic.topic,
       stewardPrincipal: `catsco-user:${parsed.reviewAgentUid}`,
       workerSessionId: `session:v2:catscompany:group:${workerTopic.topic}:agent:${parsed.workerAgentUid}`,
-      coordinatorSessionId: parsed.registration.payload.coordinatorSessionId,
-      coordinatorSessionTopicId: parsed.registration.payload.coordinatorSessionTopicId
+      coordinatorSessionId,
+      coordinatorSessionTopicId: coordinatorTopic.topic
     } } };
     const events = [registrationEvent, routedBundle];
     parsePlan(JSON.stringify(events));
@@ -632,7 +695,7 @@ async function agentTaskStart(kwargs) {
     if (!journal.bundleReceipt) journal = await journalStore.save({ phase: "bundle_ingested", bundleReceipt });
     const tickReceipt = journal.tick ?? await tick();
     journal = await journalStore.save({ phase: "completed", tick: tickReceipt });
-    return { count: 1, projectId, provisionedTopics: { workerTopic, evidenceTopic, reviewTopic }, receipts: [registrationReceipt, bundleReceipt], tick: tickReceipt, journalPath: journalStore.path };
+    return { count: 1, projectId, provisionedTopics: { coordinatorTopic, workerTopic, evidenceTopic, reviewTopic }, receipts: [registrationReceipt, bundleReceipt], tick: tickReceipt, journalPath: journalStore.path };
   } catch (error) {
     const journal = journalStore.journal();
     await journalStore.save({
@@ -650,7 +713,7 @@ async function agentTaskStart(kwargs) {
 cli({
   site: "loop",
   name: "agent-task-start",
-  description: "Review-only: atomically journal and provision one Worker execution, evidence, and Review Topic before dispatch",
+  description: "Review-only: create a fresh Project and provision coordinator, Worker execution, evidence, and Review Topics before dispatch",
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,

@@ -382,6 +382,60 @@ async function acquireExclusiveLock(path, label) {
 // src/lib/provisioning-journal.ts
 var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 var now = () => (/* @__PURE__ */ new Date()).toISOString();
+function numericIds(value) {
+  if (typeof value !== "string") return void 0;
+  const ids = value.split(",").map((id4) => id4.trim());
+  if (ids.length === 0 || ids.some((id4) => !/^[1-9]\d*$/.test(id4)) || new Set(ids).size !== ids.length) return void 0;
+  return ids.sort();
+}
+function isProvisionedTopicRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const topic = value;
+  const groupId = topic.groupId;
+  const topicId = topic.topic;
+  const kind = topic.kind;
+  return typeof groupId === "string" && typeof topicId === "string" && /^[1-9]\d*$/.test(groupId) && topicId === `grp_${groupId}` && (kind === "agent_task" || kind === "standard") && numericIds(topic.agentIds) !== void 0 && (topic.memberIds === void 0 || numericIds(topic.memberIds) !== void 0);
+}
+function hasExactAgents(topic, expected) {
+  const actual = numericIds(topic.agentIds);
+  return actual !== void 0 && actual.length === expected.length && actual.every((id4, index) => id4 === expected[index]);
+}
+function includesRoleMembers(topic, expected) {
+  const members = topic.memberIds === void 0 ? void 0 : numericIds(topic.memberIds);
+  return members === void 0 || expected.every((id4) => members.includes(id4));
+}
+function retryRolePrincipals(plan) {
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return void 0;
+  const value = plan;
+  const packet2 = value.packet;
+  const retry = value.retry;
+  if (!packet2 || typeof packet2 !== "object" || Array.isArray(packet2) || !retry || typeof retry !== "object" || Array.isArray(retry)) return void 0;
+  const packetRecord = packet2;
+  const retryRecord = retry;
+  const payload = retryRecord.payload;
+  if (packetRecord.kind !== "recover_attempt" || retryRecord.type !== "work_bundle_proposed" || !payload || typeof payload !== "object" || Array.isArray(payload)) return void 0;
+  const worker = /^catsco-user:([1-9]\d*)$/.exec(String(payload.runtimePrincipal ?? ""))?.[1];
+  const reviewer = /^catsco-user:([1-9]\d*)$/.exec(String(packetRecord.stewardPrincipal ?? ""))?.[1];
+  return worker && reviewer ? { worker, reviewer } : void 0;
+}
+function migrateLegacyRetryJournal(value, kind, id4, planDigest, plan) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("provisioning journal identity does not match the requested plan");
+  const legacy = value;
+  if (legacy.schema !== "loopctl-provision-journal-v1") throw new Error("provisioning journal identity does not match the requested plan");
+  if (kind !== "agent-task-retry") throw new Error("v1 agent-task-start journal cannot be resumed as a Project-owned coordinator invocation; create a new plan");
+  const principals = retryRolePrincipals(plan);
+  const workerTopic = legacy.workerTopic;
+  const evidenceTopic = legacy.evidenceTopic;
+  const reviewTopic = legacy.reviewTopic;
+  const workerAgents = principals ? [principals.worker] : [];
+  const evidenceAgents = principals ? [principals.worker, principals.reviewer].sort() : [];
+  const reviewAgents = principals ? [principals.reviewer] : [];
+  const topicIds = [workerTopic?.topic, evidenceTopic?.topic, reviewTopic?.topic];
+  if (legacy.kind !== kind || legacy.planDigest !== planDigest || legacy.id !== id4 || !Array.isArray(legacy.manualCleanupTopicIds) || !legacy.manualCleanupTopicIds.every((topic) => typeof topic === "string") || typeof legacy.projectId !== "string" || !/^[1-9]\d*$/.test(legacy.projectId) || !principals || !isProvisionedTopicRecord(workerTopic) || !isProvisionedTopicRecord(evidenceTopic) || !isProvisionedTopicRecord(reviewTopic) || workerTopic.kind !== "agent_task" || evidenceTopic.kind !== "standard" || reviewTopic.kind !== "standard" || new Set(topicIds).size !== topicIds.length || !hasExactAgents(workerTopic, workerAgents) || !hasExactAgents(evidenceTopic, evidenceAgents) || !hasExactAgents(reviewTopic, reviewAgents) || !includesRoleMembers(workerTopic, workerAgents) || !includesRoleMembers(evidenceTopic, evidenceAgents) || !includesRoleMembers(reviewTopic, reviewAgents)) {
+    throw new Error("v1 retry journal topology is incompatible with safe migration");
+  }
+  return { ...legacy, schema: "loopctl-provision-journal-v2" };
+}
 function directory() {
   return resolve2(process.env.LOOPCTL_PROVISION_JOURNAL_DIR?.trim() || join(homedir(), ".local", "state", "loopctl", "provisioning"));
 }
@@ -406,18 +460,21 @@ async function openProvisionJournal(kind, plan) {
   let journal;
   try {
     try {
-      journal = JSON.parse(await readFile2(path, "utf8"));
-      if (journal.schema !== "loopctl-provision-journal-v1" || journal.kind !== kind || journal.planDigest !== planDigest || journal.id !== id4) {
+      const existing = JSON.parse(await readFile2(path, "utf8"));
+      const isLegacy = !!existing && typeof existing === "object" && !Array.isArray(existing) && existing.schema === "loopctl-provision-journal-v1";
+      journal = isLegacy ? migrateLegacyRetryJournal(existing, kind, id4, planDigest, plan) : existing;
+      if (journal.schema !== "loopctl-provision-journal-v2" || journal.kind !== kind || journal.planDigest !== planDigest || journal.id !== id4) {
         throw new Error("provisioning journal identity does not match the requested plan");
       }
       if (journal.phase !== "validated" && journal.phase !== "failed") {
         throw new Error(`provisioning journal requires explicit recovery before resume: ${journal.phase}`);
       }
+      if (isLegacy) await persist(path, journal);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       const timestamp = now();
       journal = {
-        schema: "loopctl-provision-journal-v1",
+        schema: "loopctl-provision-journal-v2",
         id: id4,
         kind,
         planDigest,

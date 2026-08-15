@@ -108,7 +108,8 @@ export function parseAgentTaskStart(raw:string){
   const proposed=bundle.parse(value[1])
   const r=registration.payload, b=proposed.payload
   if(r.workItemId!==b.workItemId||b.expectedRevision!==1) throw new Error('agent-task start pair identity or revision mismatch')
-  if(!r.coordinatorSessionId||!r.coordinatorSessionTopicId) throw new Error('agent-task start requires the Review coordinator session id and canonical topic id')
+  if(r.coordinatorSessionId!==undefined||r.coordinatorSessionTopicId!==undefined) throw new Error('agent-task start provisions a new Project coordinator; do not supply coordinator session or topic fields')
+  if(b.attemptRoute!==undefined) throw new Error('agent-task start provisions its own Project routes; do not supply bundle attemptRoute')
   for(const key of ['taskContractHash','referenceSnapshotHash','writeScopeHash','acceptanceContractHash'] as const) if(r[key]!==b[key]) throw new Error(`plan contract mismatch: ${key}`)
   const worker=/^agent-task:([1-9]\d*)$/.exec(r.workerTopicId)
   const evidence=/^evidence-topic:([1-9]\d*):([1-9]\d*)$/.exec(r.evidenceTopicId??'')
@@ -117,7 +118,7 @@ export function parseAgentTaskStart(raw:string){
   if(evidence[1]!==worker[1]||review[1]!==evidence[2]) throw new Error('agent-task start placeholders must bind the same Worker and Review principals')
   if(b.runtimePrincipal!==`catsco-user:${worker[1]}`) throw new Error('agent-task start runtime principal does not match Worker UID')
   if(r.stewardPrincipal!==`catsco-user:${review[1]}`) throw new Error('agent-task start steward principal does not match Review UID')
-  if(r.catscoProjectId!=='project:auto'&&!/^[1-9]\d*$/.test(r.catscoProjectId)) throw new Error('agent-task start catscoProjectId must be numeric or project:auto')
+  if(r.catscoProjectId!=='project:new') throw new Error('agent-task start catscoProjectId must be project:new; the command creates a fresh Project')
   if(new Set([r.workerTopicId,r.evidenceTopicId,r.stewardTopicId]).size!==3) throw new Error('agent-task start topics must be distinct')
   const marker='LOOP_WORKTREE_CONTRACT_V1='
   const worktreeLines=b.workBundle.instructions.split('\n').filter(line=>line.startsWith(marker))

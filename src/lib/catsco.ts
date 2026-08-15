@@ -148,6 +148,17 @@ export async function createAgentTaskTopic(name: string, workerAgentUid: string)
   return { groupId, topic, kind: 'agent_task', agentIds }
 }
 
+/** Create a Project for one new agent-task-start invocation. Never list or reuse Projects here. */
+export async function createAttemptProject(loopId: string, attemptId: string): Promise<string> {
+  const name = `Loop ${loopId} ${attemptId}`
+  if (!name || name.length > 180) throw new CommandExecutionError('CatsCo Project name is invalid')
+  const created = asRecord(await runOpenCli(['catsco', 'project-create', name, '--format', 'json']), 'Project provisioning')
+  const projectId = String(created.id ?? created.projectId ?? created.project_id ?? '')
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError('CatsCo Project provisioning returned an invalid Project id')
+  return projectId
+}
+
+/** Legacy shared-Project resolver; never use for a new agent-task-start invocation. */
 export async function resolveLoopProject(loopId: string, requestedProjectId: string): Promise<string> {
   if (/^[1-9]\d*$/.test(requestedProjectId)) return requestedProjectId
   if (requestedProjectId !== 'project:auto') throw new CommandExecutionError('catscoProjectId must be numeric or project:auto')

@@ -4,7 +4,7 @@ import { agentTaskStart } from './src/lib/commands.js'
 cli({
   site: 'loop',
   name: 'agent-task-start',
-  description: 'Review-only: atomically journal and provision one Worker execution, evidence, and Review Topic before dispatch',
+  description: 'Review-only: create a fresh Project and provision coordinator, Worker execution, evidence, and Review Topics before dispatch',
   access: 'write',
   browser: false,
   strategy: Strategy.LOCAL,

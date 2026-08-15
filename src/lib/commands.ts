@@ -2,7 +2,7 @@ import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
-import { attachTopicToProject, createAgentTaskTopic, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
+import { attachTopicToProject, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
 
@@ -65,8 +65,16 @@ export async function agentTaskStart(kwargs:any){
   })
   try {
     let journal=journalStore.journal()
-    const projectId=journal.projectId ?? await resolveLoopProject(parsed.registration.payload.loopId, parsed.registration.payload.catscoProjectId)
+    // A journal resumes only the same invocation after a failed provisioning step.
+    // A fresh agent-task-start invocation always reaches createAttemptProject below.
+    const projectId=journal.projectId ?? await createAttemptProject(parsed.registration.payload.loopId, parsed.bundle.payload.attemptId)
     if(!journal.projectId) journal=await journalStore.save({ phase: 'project_resolved', projectId })
+
+    const coordinatorTopic=journal.coordinatorTopic ?? asRecord(await createStandardTopic(
+      `Loop ${parsed.registration.payload.loopId} ${parsed.bundle.payload.attemptId} coordinator`, [parsed.reviewAgentUid]
+    ))
+    if(!journal.coordinatorTopic) journal=await journalStore.save({ phase: 'topics_created', coordinatorTopic,
+      manualCleanupTopicIds: [...journal.manualCleanupTopicIds, coordinatorTopic.topic] })
 
     const workerTopic=journal.workerTopic ?? asRecord(await createAgentTaskTopic(
       `Loop ${parsed.registration.payload.loopId} ${parsed.bundle.payload.attemptId} execution`, parsed.workerAgentUid
@@ -86,22 +94,22 @@ export async function agentTaskStart(kwargs:any){
     if(!journal.reviewTopic) journal=await journalStore.save({ phase: 'topics_created', reviewTopic,
       manualCleanupTopicIds: [...journal.manualCleanupTopicIds, reviewTopic.topic] })
 
+    await attachTopicToProject(projectId, coordinatorTopic.topic)
     await attachTopicToProject(projectId, workerTopic.topic)
     await attachTopicToProject(projectId, evidenceTopic.topic)
     await attachTopicToProject(projectId, reviewTopic.topic)
-    journal=await journalStore.save({ phase: 'topics_attached', projectId, workerTopic, evidenceTopic, reviewTopic })
+    journal=await journalStore.save({ phase: 'topics_attached', projectId, coordinatorTopic, workerTopic, evidenceTopic, reviewTopic })
 
+    const coordinatorSessionId=`session:v2:catscompany:group:${coordinatorTopic.topic}:agent:${parsed.reviewAgentUid}`
     const registrationEvent={...parsed.registration,payload:{...parsed.registration.payload,
       catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,
       stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`,
-      coordinatorSessionId:parsed.registration.payload.coordinatorSessionId,
-      coordinatorSessionTopicId:parsed.registration.payload.coordinatorSessionTopicId}}
+      coordinatorSessionId,coordinatorSessionTopicId:coordinatorTopic.topic}}
     const routedBundle={...parsed.bundle,payload:{...parsed.bundle.payload,attemptRoute:{
       catscoProjectId:projectId,workerTopicId:workerTopic.topic,evidenceTopicId:evidenceTopic.topic,
       stewardTopicId:reviewTopic.topic,stewardPrincipal:`catsco-user:${parsed.reviewAgentUid}`,
       workerSessionId:`session:v2:catscompany:group:${workerTopic.topic}:agent:${parsed.workerAgentUid}`,
-      coordinatorSessionId:parsed.registration.payload.coordinatorSessionId!,
-      coordinatorSessionTopicId:parsed.registration.payload.coordinatorSessionTopicId!
+      coordinatorSessionId,coordinatorSessionTopicId:coordinatorTopic.topic
     }}}
     const events=[registrationEvent,routedBundle]
     parsePlan(JSON.stringify(events))
@@ -112,7 +120,7 @@ export async function agentTaskStart(kwargs:any){
     if(!journal.bundleReceipt) journal=await journalStore.save({ phase: 'bundle_ingested', bundleReceipt })
     const tickReceipt=journal.tick ?? await tick()
     journal=await journalStore.save({ phase: 'completed', tick: tickReceipt })
-    return { count: 1, projectId, provisionedTopics: { workerTopic, evidenceTopic, reviewTopic }, receipts: [registrationReceipt,bundleReceipt], tick: tickReceipt, journalPath: journalStore.path }
+    return { count: 1, projectId, provisionedTopics: { coordinatorTopic, workerTopic, evidenceTopic, reviewTopic }, receipts: [registrationReceipt,bundleReceipt], tick: tickReceipt, journalPath: journalStore.path }
   } catch(error) {
     const journal=journalStore.journal()
     await journalStore.save({ phase: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 1000),

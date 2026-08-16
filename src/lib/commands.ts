@@ -4,7 +4,7 @@ import { actionPacketSchema, receiptSchema, statusSchema, tickSchema, workerPref
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
 import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
-import { assertConfiguredControllerOwner, readNativeActionPacket, readNativePreflightPacket, sendBotPreflightEvidence } from './catsco-bot-preflight.js'
+import { assertConfiguredControllerOwner, readNativeActionPacket, readNativePreflightPacket, sendBotAttemptEvidence, sendBotPreflightEvidence } from './catsco-bot-preflight.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
 import { verifyTrustedControllerPreflightPacket } from './controller-provenance.js'
@@ -344,7 +344,21 @@ export async function readinessSubmit(kwargs:any){
   return submitAttestedEvent(String(kwargs['event-file']),workerReadySubmission,'worker_ready')
 }
 export async function runtimeStartSubmit(kwargs:any){
-  return submitAttestedEvent(String(kwargs['event-file']),runtimeStartedSubmission,'runtime_started')
+  if(kwargs['event-file']!==undefined) throw new ArgumentError('event-file is not supported; runtime-start-submit reads the native Bot-authenticated execute Action')
+  const receivedTopic=String(kwargs['received-topic']??'')
+  let packet: ReturnType<typeof actionPacketSchema.parse>
+  try { packet=actionPacketSchema.parse(await readNativeActionPacket(receivedTopic,'execute_attempt')) }
+  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid native Controller execute packet') }
+  if(packet.kind!=='execute_attempt'||packet.action.kind!=='execute_attempt'||packet.action.state!=='ready') throw new ArgumentError('native Controller execute packet is not a ready execute_attempt')
+  const raw=packet as unknown as WorkerAttemptPacket
+  assertConfiguredControllerOwner(raw.ownerUid)
+  verifyTrustedControllerPreflightPacket(raw)
+  validateWorkerExecutePacket(raw,receivedTopic)
+  const idempotencyKey=stableId('runtime_started',[raw.attemptId,String(raw.generation),raw.workerSessionId])
+  const event={eventId:idempotencyKey,idempotencyKey,source:raw.runtimePrincipal,entityRef:`attempt:${raw.attemptId}`,type:'runtime_started' as const,payload:{workItemId:raw.workItemId,expectedRevision:raw.workItemRevision,attemptId:raw.attemptId,generation:raw.generation,runtimePrincipal:raw.runtimePrincipal,workerSessionId:raw.workerSessionId,signature:'catsco-message-attested' as const}}
+  const content=canonicalJson(event)
+  const receipt=await sendBotAttemptEvidence(raw.evidenceTopicId,content,idempotencyKey,raw.runtimePrincipal.slice('catsco-user:'.length),'runtime_started')
+  return {targetTopicId:raw.evidenceTopicId,event:JSON.parse(content),receipt}
 }
 export async function candidateSubmit(kwargs:any){
   return submitAttestedEvent(String(kwargs['event-file']),candidateSubmission,'Candidate')

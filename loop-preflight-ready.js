@@ -297,15 +297,15 @@ async function readNativeActionPacket(receivedTopic, expectedKind) {
 async function readNativePreflightPacket(receivedTopic) {
   return readNativeActionPacket(receivedTopic, "preflight_attempt");
 }
-function isExactLatestReceipt(row2, receipt, expectedUid, content) {
-  if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== "worker_ready") return false;
+function isExactLatestReceipt(row2, receipt, expectedUid, content, eventType) {
+  if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== eventType) return false;
   try {
     return canonicalJson(row2.content) === content;
   } catch {
     return false;
   }
 }
-async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedUid, beforeSend) {
+async function sendBotAttemptEvidence(topicId, content, clientMsgId, expectedUid, eventType, beforeSend) {
   const c = loadConfig();
   if (c.expectedBotUid !== expectedUid) throw new ArgumentError("Bot preflight config identity does not match signed packet principal");
   const key = apiKey(c);
@@ -317,8 +317,11 @@ async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedU
   const history = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "message receipt");
   if (!Array.isArray(history.messages) || history.messages.length === 0 || history.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
   const newest = record(history.messages.at(-1), "message receipt");
-  if (!isExactLatestReceipt(newest, receipt, expectedUid, content)) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
+  if (!isExactLatestReceipt(newest, receipt, expectedUid, content, eventType)) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
   return receipt;
+}
+async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedUid, beforeSend) {
+  return sendBotAttemptEvidence(topicId, content, clientMsgId, expectedUid, "worker_ready", beforeSend);
 }
 
 // src/lib/exclusive-lock.ts

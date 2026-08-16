@@ -2,6 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
+import { createHash as createHash3 } from "node:crypto";
 import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
@@ -144,131 +145,178 @@ function canonicalJson(value) {
 var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 
 // src/lib/loopctl.ts
-import { constants as fsConstants } from "node:fs";
-import { realpath, lstat, open } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
 import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
 var MAX_INPUT = 512 * 1024;
 var jsonValue = z3.unknown();
-async function readConfinedFile(file) {
-  if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
-  const cwd = resolve(process.cwd());
-  const requested = resolve(cwd, file);
-  const info = await lstat(requested);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("input file must be a regular non-symlink file");
-  const actual = await realpath(requested);
-  const rel = relative(cwd, actual);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
-  const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("input file must remain a regular file");
-    const value = await handle.readFile("utf8");
-    if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
-    return value;
-  } finally {
-    await handle.close();
-  }
-}
 
 // src/lib/catsco.ts
-import { spawn } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
-var TIMEOUT_MS = 3e4;
-function unwrap(value) {
-  if (value && typeof value === "object" && "data" in value) return value.data;
-  return value;
-}
-function asRecord(value, label) {
-  const row2 = unwrap(value);
-  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2(`CatsCo ${label} returned a non-object`);
-  return row2;
-}
-function asIdentityRecord(value) {
-  const identity = unwrap(value);
-  const row2 = Array.isArray(identity) && identity.length === 1 ? identity[0] : identity;
-  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo identity returned an invalid response");
-  return row2;
-}
-async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal, beforeSend) {
-  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError2("attested event targetTopicId must be a CatsCo Attempt topic");
-  if (!clientMsgId.trim()) throw new CommandExecutionError2("attested event idempotencyKey is required");
-  const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1];
-  if (!expectedUid) throw new CommandExecutionError2("attested event source must be a numeric CatsCo principal");
-  const authenticatedUid = await authenticatedCatscoUid();
-  if (authenticatedUid !== expectedUid) throw new CommandExecutionError2("CatsCo authenticated sender does not match attested event source");
-  beforeSend?.();
-  const sent = asRecord(await runOpenCli(["catsco", "send", topicId, content, "--client-message-id", clientMsgId, "--format", "json"]), "attested event send");
-  const receipt = {
-    messageId: String(sent.messageId ?? ""),
-    topicId: String(sent.topicId ?? ""),
-    clientMsgId: String(sent.clientMsgId ?? ""),
-    seqId: String(sent.seqId ?? ""),
-    duplicate: sent.duplicate === true,
-    contentDigest: String(sent.contentDigest ?? "")
-  };
-  if (!receipt.messageId || !receipt.seqId || receipt.topicId !== topicId || receipt.clientMsgId !== clientMsgId || !receipt.contentDigest) {
-    throw new CommandExecutionError2("CatsCo attested event send receipt failed verification");
-  }
-  const confirmed = asRecord(await runOpenCli(["catsco", "message-receipt", topicId, "--client-message-id", clientMsgId, "--format", "json"]), "attested event receipt");
-  if (confirmed.found !== true || confirmed.serverConfirmed !== true || String(confirmed.topicId ?? "") !== topicId || String(confirmed.clientMsgId ?? "") !== clientMsgId || String(confirmed.seqId ?? "") !== receipt.seqId || String(confirmed.contentDigest ?? "") !== receipt.contentDigest) {
-    throw new CommandExecutionError2("CatsCo attested event receipt was not server-confirmed");
-  }
-  return receipt;
-}
-async function runOpenCli(args) {
-  return await new Promise((resolve2, reject) => {
-    const child = spawn(process.env.OPENCLI_BINARY?.trim() || "opencli", args, { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-    }, TIMEOUT_MS);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT2) {
-        killed = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk).slice(0, 4096);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(new CommandExecutionError2(`CatsCo provisioning unavailable: ${error.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) return reject(new CommandExecutionError2("CatsCo provisioning timed out or produced too much output"));
-      if (code !== 0) return reject(new CommandExecutionError2(`CatsCo provisioning failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
-      try {
-        resolve2(JSON.parse(stdout));
-      } catch {
-        reject(new CommandExecutionError2("CatsCo provisioning returned invalid JSON"));
-      }
-    });
-  });
-}
-async function authenticatedCatscoUid() {
-  const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
-  const uid = String(row2.uid ?? "");
-  if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
-  return uid;
-}
 
 // src/lib/catsco-bot-preflight.ts
+import { createHash } from "node:crypto";
+import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
 import { z as z4 } from "zod";
 var MAX_CONFIG_BYTES = 16 * 1024;
 var MAX_KEY_BYTES = 8 * 1024;
 var MAX_RESPONSE_BYTES = 128 * 1024;
+var MAX_HISTORY_ROWS = 100;
+var REQUEST_TIMEOUT_MS = 15e3;
+var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
 var configSchema = z4.object({ version: z4.literal(1), transport: z4.literal("catsco-bot-preflight-v1"), httpBaseUrl: z4.string().min(1), expectedBotUid: z4.string().regex(/^[1-9]\d*$/), controllerUid: z4.literal("602").default("602"), apiKeyFile: z4.string().min(1) }).strict();
+function configuredPath() {
+  return process.env.LOOPCTL_BOT_PREFLIGHT_CONFIG?.trim() || join(homedir(), ".config", "loopctl", "catsco-bot-preflight.json");
+}
+function secureRead(path, maxBytes, label) {
+  let fd;
+  try {
+    const before = lstatSync(path);
+    if (before.isSymbolicLink() || !before.isFile()) throw new Error(`${label} must be a regular file`);
+    if ((before.mode & 511) !== 384) throw new Error(`${label} must have mode 0600`);
+    if (typeof process.getuid === "function" && before.uid !== process.getuid()) throw new Error(`${label} must be owned by the current user`);
+    if (before.size > maxBytes) throw new Error(`${label} is too large`);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const after = fstatSync(fd);
+    if (!after.isFile() || (after.mode & 511) !== 384 || after.size > maxBytes || after.dev !== before.dev || after.ino !== before.ino || typeof process.getuid === "function" && after.uid !== process.getuid()) throw new Error(`${label} changed while opening or is unsafe`);
+    return readFileSync(fd, "utf8");
+  } finally {
+    if (fd !== void 0) closeSync(fd);
+  }
+}
+function loadConfig() {
+  try {
+    const c = configSchema.parse(JSON.parse(secureRead(configuredPath(), MAX_CONFIG_BYTES, "Bot preflight config")));
+    const u = new URL(c.httpBaseUrl);
+    if (c.httpBaseUrl !== TRUSTED_HTTP_BASE_URL || u.protocol !== "https:" || u.hostname !== "app.catsco.cc" || u.port || u.username || u.password || u.pathname !== "/" || u.search || u.hash) throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
+    if (!c.apiKeyFile.startsWith("/")) throw new Error("apiKeyFile must be an absolute path");
+    return c;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight configuration is unavailable or invalid: ${e instanceof Error ? e.message : "invalid configuration"}`);
+  }
+}
+function apiKey(c) {
+  try {
+    const v = secureRead(c.apiKeyFile, MAX_KEY_BYTES, "Bot preflight API key").trim();
+    if (!v || /[\r\n\0]/.test(v)) throw new Error("Bot preflight API key is invalid");
+    return v;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight API key is unavailable or invalid: ${e instanceof Error ? e.message : "invalid key"}`);
+  }
+}
+async function boundedResponseText(r) {
+  if (!r.body) throw new CommandExecutionError3("CatsCo Bot API response body is unavailable");
+  const reader = r.body.getReader(), chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const n = await reader.read();
+      if (n.done) break;
+      bytes += n.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => void 0);
+        throw new CommandExecutionError3("CatsCo Bot API response is too large");
+      }
+      chunks.push(n.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const c of chunks) {
+    all.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+async function request(key, path, init) {
+  const c = new AbortController(), timer = setTimeout(() => c.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${TRUSTED_HTTP_BASE_URL}${path}`, { ...init, redirect: "error", signal: c.signal, headers: { Authorization: `ApiKey ${key}`, ...init.headers } });
+    const text = await boundedResponseText(r);
+    if (!r.ok) throw new CommandExecutionError3(`CatsCo Bot API request failed with HTTP ${r.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new CommandExecutionError3("CatsCo Bot API returned invalid JSON");
+    }
+  } catch (e) {
+    if (e instanceof CommandExecutionError3) throw e;
+    throw new CommandExecutionError3(`CatsCo Bot API request failed: ${e instanceof Error ? e.name : "network error"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function record(v, label) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new CommandExecutionError3(`CatsCo Bot API returned invalid ${label}`);
+  return v;
+}
+function contentDigest(content) {
+  return createHash("sha256").update(content).digest("hex");
+}
+async function authenticated(c, key) {
+  const me = record(await request(key, "/api/me", { method: "GET" }), "identity");
+  if (String(me.uid ?? "") !== c.expectedBotUid || String(me.account_type ?? "").toLowerCase() !== "bot") throw new CommandExecutionError3("CatsCo Bot API identity does not match configured Worker Bot");
+}
+function assertConfiguredControllerOwner(ownerUid) {
+  if (ownerUid !== loadConfig().controllerUid) throw new ArgumentError("preflight packet ownerUid does not match configured Controller UID");
+}
+async function readNativeActionPacket(receivedTopic, expectedKind) {
+  if (!/^grp_[1-9]\d*$/.test(receivedTopic)) throw new ArgumentError("received-topic must be a numeric CatsCo group topic");
+  const c = loadConfig(), key = apiKey(c);
+  await authenticated(c, key);
+  const response = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "native Action history");
+  if (!Array.isArray(response.messages) || response.messages.length === 0 || response.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid native Action history");
+  const candidates = [];
+  for (const rawRow of response.messages) {
+    const row2 = record(rawRow, "native Action message");
+    const sender = String(row2.from_uid ?? row2.from ?? "");
+    if (sender === c.expectedBotUid) continue;
+    if (sender !== c.controllerUid) throw new CommandExecutionError3("native Action message sender is invalid");
+    if (String(row2.topic_id ?? "") !== receivedTopic) throw new CommandExecutionError3("native Action message topic is invalid");
+    if (!/^\d+$/.test(String(row2.id ?? "")) || String(row2.id) !== String(row2.seq_id ?? "")) throw new CommandExecutionError3("native Action message id/seq is invalid");
+    if (String(row2.type ?? "") !== "text" || String(row2.msg_type ?? "text") !== "text") throw new CommandExecutionError3("native Action message type is invalid");
+    for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
+    let packet;
+    try {
+      packet = typeof row2.content === "string" ? JSON.parse(row2.content) : JSON.parse(canonicalJson(row2.content));
+    } catch {
+      throw new CommandExecutionError3("native Action message content is not a JSON packet");
+    }
+    if (!packet || typeof packet !== "object" || Array.isArray(packet) || typeof packet.kind !== "string") throw new CommandExecutionError3("native Action message content is not an Action packet");
+    if (packet.kind === expectedKind) candidates.push(packet);
+  }
+  if (candidates.length !== 1) throw new CommandExecutionError3(`CatsCo Bot API found ${candidates.length} eligible native Controller ${expectedKind} Action messages; expected exactly one`);
+  return candidates[0];
+}
+function isExactLatestReceipt(row2, receipt, expectedUid, content, eventType) {
+  if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== eventType) return false;
+  try {
+    return canonicalJson(row2.content) === content;
+  } catch {
+    return false;
+  }
+}
+async function sendBotAttemptEvidence(topicId, content, clientMsgId, expectedUid, eventType, beforeSend) {
+  const c = loadConfig();
+  if (c.expectedBotUid !== expectedUid) throw new ArgumentError("Bot preflight config identity does not match signed packet principal");
+  const key = apiKey(c);
+  await authenticated(c, key);
+  beforeSend?.();
+  const sent = record(await request(key, "/api/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic_id: topicId, client_msg_id: clientMsgId, content, msg_type: "text", type: "text" }) }), "send receipt");
+  const receipt = { messageId: String(sent.id ?? ""), topicId: String(sent.topic_id ?? ""), clientMsgId: String(sent.client_msg_id ?? ""), seqId: String(sent.seq_id ?? ""), duplicate: sent.duplicate === true, contentDigest: contentDigest(content) };
+  if (!receipt.messageId || !receipt.seqId || receipt.messageId !== receipt.seqId || receipt.topicId !== topicId || String(sent.from_uid ?? "") !== expectedUid || receipt.clientMsgId !== clientMsgId) throw new CommandExecutionError3("CatsCo Bot API send receipt failed verification");
+  const history = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "message receipt");
+  if (!Array.isArray(history.messages) || history.messages.length === 0 || history.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
+  const newest = record(history.messages.at(-1), "message receipt");
+  if (!isExactLatestReceipt(newest, receipt, expectedUid, content, eventType)) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
+  return receipt;
+}
 
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
@@ -286,29 +334,141 @@ var packetSchema = z5.object({
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
+import { createHash as createHash2, createPublicKey, verify } from "node:crypto";
+import { closeSync as closeSync2, constants as constants2, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readFileSync as readFileSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
 import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
 import { z as z6 } from "zod";
+var SIGNING_ALGORITHM = "ed25519";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
 var trustedControllerKeysSchema = z6.object({
   version: z6.literal(1),
   keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
+function controllerCanonicalJson(value) {
+  return JSON.stringify(normalize(value));
+}
+function normalize(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("canonical JSON rejects non-finite numbers");
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (Array.isArray(value)) return value.map(normalize);
+  if (typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) {
+      const item = value[key];
+      if (item !== void 0) result[key] = normalize(item);
+    }
+    return result;
+  }
+  throw new TypeError(`canonical JSON rejects ${typeof value}`);
+}
+function controllerKeyId(publicKey) {
+  return `controller-ed25519:${createHash2("sha256").update(publicKey).digest("base64url")}`;
+}
+function defaultTrustedKeysPath() {
+  return join2(homedir2(), ".config", "loopctl", "trusted-controller-keys.json");
+}
+function trustedKeysPath() {
+  const configured = process.env.LOOPCTL_TRUSTED_CONTROLLER_KEYS_FILE?.trim();
+  return configured || defaultTrustedKeysPath();
+}
+function readTrustedKeysFile(path) {
+  let descriptor;
+  try {
+    const pathStats = lstatSync2(path);
+    if (pathStats.isSymbolicLink()) throw new Error("trusted Controller key file must not be a symbolic link");
+    if (!pathStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((pathStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    descriptor = openSync2(path, constants2.O_RDONLY | constants2.O_NOFOLLOW);
+    const descriptorStats = fstatSync2(descriptor);
+    if (!descriptorStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((descriptorStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    if (descriptorStats.size > MAX_TRUSTED_KEYS_BYTES) throw new Error("trusted Controller key file is too large");
+    if (typeof process.getuid === "function" && descriptorStats.uid !== process.getuid()) throw new Error("trusted Controller key file must be owned by the current user");
+    if (descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino) throw new Error("trusted Controller key file changed while opening");
+    return readFileSync2(descriptor, "utf8");
+  } finally {
+    if (descriptor !== void 0) closeSync2(descriptor);
+  }
+}
+function trustedKey(packet) {
+  let config;
+  try {
+    config = trustedControllerKeysSchema.parse(JSON.parse(readTrustedKeysFile(trustedKeysPath())));
+    const identities = /* @__PURE__ */ new Set();
+    for (const key of config.keys) {
+      const identity = `${key.ownerUid}\0${key.controllerKeyId}`;
+      if (identities.has(identity)) throw new Error("trusted Controller key configuration has duplicate owner/key entries");
+      identities.add(identity);
+      if (key.controllerKeyId !== controllerKeyId(key.publicKey)) throw new Error("trusted Controller key configuration has an invalid key ID");
+      if (createPublicKey(key.publicKey).asymmetricKeyType !== SIGNING_ALGORITHM) throw new Error("trusted Controller key configuration has a non-Ed25519 public key");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "invalid configuration";
+    throw new ArgumentError2(`trusted Controller key configuration is unavailable or invalid: ${detail}`);
+  }
+  const matches = config.keys.filter((key) => key.ownerUid === packet.ownerUid && key.controllerKeyId === packet.controllerKeyId);
+  if (matches.length !== 1) throw new ArgumentError2("preflight packet Controller key is not pinned for its owner");
+  const pin = matches[0];
+  if (pin.publicKey !== packet.controllerPublicKey) throw new ArgumentError2("preflight packet Controller public key does not match its trusted pin");
+  return pin;
+}
+function verifyTrustedControllerPreflightPacket(packet) {
+  if (packet.controllerSignatureAlgorithm !== SIGNING_ALGORITHM) throw new ArgumentError2("preflight packet Controller signature algorithm is invalid");
+  if (packet.controllerKeyId !== controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError2("preflight packet Controller key ID does not match its public key");
+  trustedKey(packet);
+  const { controllerSignature: _signature, packetDigest, ...withoutDigest } = packet;
+  const expectedDigest = createHash2("sha256").update(controllerCanonicalJson(withoutDigest)).digest("hex");
+  if (packetDigest !== expectedDigest) throw new ArgumentError2("preflight packet packetDigest does not match the canonical Controller action packet");
+  const { controllerSignature: _ignoredSignature, ...signaturePayload } = packet;
+  try {
+    const verified = verify(null, Buffer.from(controllerCanonicalJson(signaturePayload)), createPublicKey(packet.controllerPublicKey), Buffer.from(packet.controllerSignature, "base64"));
+    if (!verified) throw new Error("signature mismatch");
+  } catch {
+    throw new ArgumentError2("preflight packet Controller signature is invalid");
+  }
+}
 
 // src/lib/commands.ts
-async function submitAttestedEvent(file, schema, label) {
-  let submission;
-  try {
-    submission = schema.parse(JSON.parse(await readConfinedFile(file)));
-  } catch (error) {
-    throw new ArgumentError3(error instanceof Error ? error.message : `invalid ${label} submission file`);
-  }
-  const content = canonicalJson(submission.event);
-  const event = JSON.parse(content);
-  const receipt = await sendAttemptEvent(submission.targetTopicId, content, submission.event.idempotencyKey, event.source);
-  return { targetTopicId: submission.targetTopicId, event: JSON.parse(content), receipt };
+var numericCatscoPrincipal = /^catsco-user:([1-9]\d*)$/;
+var numericGroupTopic = /^grp_[1-9]\d*$/;
+var stableId = (prefix, parts) => `${prefix}:${createHash3("sha256").update(parts.join("\0")).digest("hex")}`;
+function assertFutureLease(packet) {
+  if (Date.parse(packet.leaseExpiresAt) <= Date.now()) throw new ArgumentError3("preflight packet leaseExpiresAt must be in the future");
+}
+function validateWorkerExecutePacket(packet, receivedTopic) {
+  assertFutureLease(packet);
+  const principalMatch = numericCatscoPrincipal.exec(packet.runtimePrincipal);
+  if (!principalMatch) throw new ArgumentError3("execute packet runtime principal must be a numeric CatsCo Bot principal");
+  const principal = `catsco-user:${principalMatch[1]}`;
+  if (!numericGroupTopic.test(receivedTopic) || !/^\d+$/.test(packet.catscoProjectId)) throw new ArgumentError3("execute packet route is invalid");
+  if (packet.actionId !== packet.action.id || packet.actionKey !== packet.action.key || packet.kind !== "execute_attempt" || packet.action.kind !== "execute_attempt" || packet.action.state !== "ready" || packet.workItemRevision !== packet.action.workItemRevision || packet.targetPrincipal !== packet.action.targetPrincipal || packet.targetTopicId !== packet.action.targetTopicId || packet.targetDigest !== packet.action.targetDigest) throw new ArgumentError3("execute packet action duplicates do not agree");
+  if (packet.targetPrincipal !== principal || packet.runtimePrincipal !== principal || packet.targetTopicId !== receivedTopic || packet.workerTopicId !== receivedTopic) throw new ArgumentError3("execute packet target/runtime route does not match the native Worker topic");
+  if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId === receivedTopic || packet.workerSessionId !== `session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`) throw new ArgumentError3("execute packet evidence route or Worker session is invalid");
 }
 async function runtimeStartSubmit(kwargs) {
-  return submitAttestedEvent(String(kwargs["event-file"]), runtimeStartedSubmission, "runtime_started");
+  if (kwargs["event-file"] !== void 0) throw new ArgumentError3("event-file is not supported; runtime-start-submit reads the native Bot-authenticated execute Action");
+  const receivedTopic = String(kwargs["received-topic"] ?? "");
+  let packet;
+  try {
+    packet = actionPacketSchema.parse(await readNativeActionPacket(receivedTopic, "execute_attempt"));
+  } catch (error) {
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid native Controller execute packet");
+  }
+  if (packet.kind !== "execute_attempt" || packet.action.kind !== "execute_attempt" || packet.action.state !== "ready") throw new ArgumentError3("native Controller execute packet is not a ready execute_attempt");
+  const raw = packet;
+  assertConfiguredControllerOwner(raw.ownerUid);
+  verifyTrustedControllerPreflightPacket(raw);
+  validateWorkerExecutePacket(raw, receivedTopic);
+  const idempotencyKey = stableId("runtime_started", [raw.attemptId, String(raw.generation), raw.workerSessionId]);
+  const event = { eventId: idempotencyKey, idempotencyKey, source: raw.runtimePrincipal, entityRef: `attempt:${raw.attemptId}`, type: "runtime_started", payload: { workItemId: raw.workItemId, expectedRevision: raw.workItemRevision, attemptId: raw.attemptId, generation: raw.generation, runtimePrincipal: raw.runtimePrincipal, workerSessionId: raw.workerSessionId, signature: "catsco-message-attested" } };
+  const content = canonicalJson(event);
+  const receipt = await sendBotAttemptEvidence(raw.evidenceTopicId, content, idempotencyKey, raw.runtimePrincipal.slice("catsco-user:".length), "runtime_started");
+  return { targetTopicId: raw.evidenceTopicId, event: JSON.parse(content), receipt };
 }
 
 // loop-runtime-start-submit.ts
@@ -319,7 +479,7 @@ cli({
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,
-  args: [{ name: "event-file", help: "Relative runtime_started submission JSON file", required: true }],
+  args: [{ name: "received-topic", help: "Native received CatsCo grp_<id> execution topic", required: true }],
   columns: ["targetTopicId", "event", "receipt"],
   defaultFormat: "json",
   func: runtimeStartSubmit

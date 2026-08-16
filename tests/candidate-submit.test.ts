@@ -98,28 +98,8 @@ describe('attempt event submission', () => {
     expect(argv[2]).toEqual(['catsco', 'message-receipt', 'grp_42', '--client-message-id', 'worker-ready-idempotency-1', '--format', 'json'])
   })
 
-  it('sends only canonical runtime_started JSON and requires a matching server receipt', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'runtime-start-submit-')); roots.push(root)
-    const calls = installOpenCli(root)
-    writeFileSync(join(root, 'runtime-started.json'), JSON.stringify(runtimeSubmission()))
-    const cwd = process.cwd(); process.chdir(root)
-    try {
-      const result = await runtimeStartSubmit({ 'event-file': 'runtime-started.json' })
-      expect(result.receipt).toMatchObject({ topicId: 'grp_42', clientMsgId: 'runtime-started-idempotency-1', seqId: '9' })
-    } finally { process.chdir(cwd) }
-    const argv = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    expect(argv[0]).toEqual(['catsco', 'me', '--format', 'json'])
-    expect(argv[1]).toEqual(['catsco', 'send', 'grp_42', expect.any(String), '--client-message-id', 'runtime-started-idempotency-1', '--format', 'json'])
-    expect(JSON.parse(argv[1][3])).toEqual(runtimeSubmission().event)
-    expect(argv[2]).toEqual(['catsco', 'message-receipt', 'grp_42', '--client-message-id', 'runtime-started-idempotency-1', '--format', 'json'])
-  })
-
-  it('rejects runtime_started transport metadata embedded in the event', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'runtime-start-submit-')); roots.push(root)
-    writeFileSync(join(root, 'runtime-started.json'), JSON.stringify({ ...runtimeSubmission(), event: { ...runtimeSubmission().event, targetTopicId: 'grp_42' } }))
-    const cwd = process.cwd(); process.chdir(root)
-    try { await expect(runtimeStartSubmit({ 'event-file': 'runtime-started.json' })).rejects.toThrow() }
-    finally { process.chdir(cwd) }
+  it('rejects local runtime_started event files', async () => {
+    await expect(runtimeStartSubmit({ 'event-file': 'runtime-started.json' })).rejects.toThrow('event-file is not supported')
   })
 
   it('sends only canonical Candidate JSON and requires a matching server receipt', async () => {

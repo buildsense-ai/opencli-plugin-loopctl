@@ -8,7 +8,7 @@ cli({
   access: 'write',
   browser: false,
   strategy: Strategy.LOCAL,
-  args: [{ name: 'event-file', help: 'Relative runtime_started submission JSON file', required: true }],
+  args: [{ name: 'received-topic', help: 'Native received CatsCo grp_<id> execution topic', required: true }],
   columns: ['targetTopicId', 'event', 'receipt'],
   defaultFormat: 'json',
   func: runtimeStartSubmit

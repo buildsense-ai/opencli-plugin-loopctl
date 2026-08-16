@@ -4,10 +4,12 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { z } from 'zod'
+import { canonicalJson } from './events.js'
 
 const MAX_CONFIG_BYTES=16*1024
 const MAX_KEY_BYTES=8*1024
 const MAX_RESPONSE_BYTES=128*1024
+const MAX_RECEIPT_HISTORY=100
 const REQUEST_TIMEOUT_MS=15_000
 const TRUSTED_HTTP_BASE_URL='https://app.catsco.cc'
 const configSchema=z.object({
@@ -100,10 +102,28 @@ async function request(key:string,path:string,init:RequestInit):Promise<unknown>
 }
 function record(value:unknown,label:string):Record<string,unknown> { if(!value||typeof value!=='object'||Array.isArray(value)) throw new CommandExecutionError(`CatsCo Bot API returned invalid ${label}`); return value as Record<string,unknown> }
 function contentDigest(content:string):string { return createHash('sha256').update(content).digest('hex') }
-function historyRows(value:unknown, topicId:string, sequence:string):Record<string,unknown>[] {
+function historyRows(value:unknown):Record<string,unknown>[] {
   const envelope=record(value,'message receipt')
-  if(String(envelope.topic_id??'')!==topicId || String(envelope.around_id??'')!==sequence || !Array.isArray(envelope.messages)) throw new CommandExecutionError('CatsCo Bot API returned invalid exact message receipt')
+  if(!Array.isArray(envelope.messages) || envelope.messages.length===0 || envelope.messages.length>MAX_RECEIPT_HISTORY) {
+    throw new CommandExecutionError('CatsCo Bot API returned invalid latest message receipt')
+  }
   return envelope.messages.map(row=>record(row,'message receipt'))
+}
+
+function isExactLatestReceipt(
+  row: Record<string, unknown>,
+  receipt: BotPreflightReceipt,
+  expectedUid: string,
+  content: string,
+): boolean {
+  if (String(row.id??'')!==receipt.messageId || String(row.seq_id??'')!==receipt.seqId ||
+    String(row.topic_id??'')!==receipt.topicId || String(row.from_uid??row.from??'')!==expectedUid ||
+    String(row.type??'')!=='worker_ready') return false
+  try {
+    return canonicalJson(row.content)===content
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -122,10 +142,13 @@ export async function sendBotPreflightEvidence(topicId:string, content:string, c
   const sent=record(await request(key,'/api/messages/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic_id:topicId,client_msg_id:clientMsgId,content,msg_type:'text',type:'text'})}),'send receipt')
   const receipt:BotPreflightReceipt={messageId:String(sent.id??''),topicId:String(sent.topic_id??''),clientMsgId:String(sent.client_msg_id??''),seqId:String(sent.seq_id??''),duplicate:sent.duplicate===true,contentDigest:contentDigest(content)}
   if(!receipt.messageId || !receipt.seqId || receipt.messageId!==receipt.seqId || receipt.topicId!==topicId || String(sent.from_uid??'')!==expectedUid || receipt.clientMsgId!==clientMsgId) throw new CommandExecutionError('CatsCo Bot API send receipt failed verification')
-  // The server supports around_id and returns a bounded envelope containing
-  // the exact persisted message, avoiding false negatives after >100 sends.
-  const history=historyRows(await request(key,`/api/messages?topic_id=${encodeURIComponent(topicId)}&around_id=${encodeURIComponent(receipt.seqId)}&limit=1`,{method:'GET'}),topicId,receipt.seqId)
-  const confirmed=history.find(row=>String(row.id??'')===receipt.messageId && String(row.seq_id??'')===receipt.seqId && String(row.topic_id??'')===topicId && String(row.from_uid??row.from??'')===expectedUid && String(row.type??'')==='text' && String(row.content??'')===content)
-  if(!confirmed) throw new CommandExecutionError('CatsCo Bot API receipt was not server-confirmed')
+  // The deployed server's around_id path is unavailable. Read a bounded latest
+  // page instead and require our exact receipt to remain the newest row. A
+  // concurrent later message therefore fails closed rather than being accepted.
+  const history=historyRows(await request(key,`/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`,{method:'GET'}))
+  const newest=history.at(-1)
+  if(!newest || !isExactLatestReceipt(newest,receipt,expectedUid,content)) {
+    throw new CommandExecutionError('CatsCo Bot API receipt was not server-confirmed')
+  }
   return receipt
 }

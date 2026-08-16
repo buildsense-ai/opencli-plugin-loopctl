@@ -188,6 +188,7 @@ import { z as z4 } from "zod";
 var MAX_CONFIG_BYTES = 16 * 1024;
 var MAX_KEY_BYTES = 8 * 1024;
 var MAX_RESPONSE_BYTES = 128 * 1024;
+var MAX_RECEIPT_HISTORY = 100;
 var REQUEST_TIMEOUT_MS = 15e3;
 var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
 var configSchema = z4.object({
@@ -298,10 +299,20 @@ function record(value, label) {
 function contentDigest(content) {
   return createHash("sha256").update(content).digest("hex");
 }
-function historyRows(value, topicId, sequence) {
+function historyRows(value) {
   const envelope = record(value, "message receipt");
-  if (String(envelope.topic_id ?? "") !== topicId || String(envelope.around_id ?? "") !== sequence || !Array.isArray(envelope.messages)) throw new CommandExecutionError3("CatsCo Bot API returned invalid exact message receipt");
+  if (!Array.isArray(envelope.messages) || envelope.messages.length === 0 || envelope.messages.length > MAX_RECEIPT_HISTORY) {
+    throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
+  }
   return envelope.messages.map((row2) => record(row2, "message receipt"));
+}
+function isExactLatestReceipt(row2, receipt, expectedUid, content) {
+  if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== "worker_ready") return false;
+  try {
+    return canonicalJson(row2.content) === content;
+  } catch {
+    return false;
+  }
 }
 async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedUid, beforeSend) {
   const config = loadConfig();
@@ -313,9 +324,11 @@ async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedU
   const sent = record(await request(key, "/api/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic_id: topicId, client_msg_id: clientMsgId, content, msg_type: "text", type: "text" }) }), "send receipt");
   const receipt = { messageId: String(sent.id ?? ""), topicId: String(sent.topic_id ?? ""), clientMsgId: String(sent.client_msg_id ?? ""), seqId: String(sent.seq_id ?? ""), duplicate: sent.duplicate === true, contentDigest: contentDigest(content) };
   if (!receipt.messageId || !receipt.seqId || receipt.messageId !== receipt.seqId || receipt.topicId !== topicId || String(sent.from_uid ?? "") !== expectedUid || receipt.clientMsgId !== clientMsgId) throw new CommandExecutionError3("CatsCo Bot API send receipt failed verification");
-  const history = historyRows(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&around_id=${encodeURIComponent(receipt.seqId)}&limit=1`, { method: "GET" }), topicId, receipt.seqId);
-  const confirmed = history.find((row2) => String(row2.id ?? "") === receipt.messageId && String(row2.seq_id ?? "") === receipt.seqId && String(row2.topic_id ?? "") === topicId && String(row2.from_uid ?? row2.from ?? "") === expectedUid && String(row2.type ?? "") === "text" && String(row2.content ?? "") === content);
-  if (!confirmed) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
+  const history = historyRows(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`, { method: "GET" }));
+  const newest = history.at(-1);
+  if (!newest || !isExactLatestReceipt(newest, receipt, expectedUid, content)) {
+    throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
+  }
   return receipt;
 }
 

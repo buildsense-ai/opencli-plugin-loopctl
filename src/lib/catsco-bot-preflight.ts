@@ -9,7 +9,7 @@ import { canonicalJson } from './events.js'
 const MAX_CONFIG_BYTES=16*1024
 const MAX_KEY_BYTES=8*1024
 const MAX_RESPONSE_BYTES=128*1024
-const MAX_RECEIPT_HISTORY=100
+const MAX_HISTORY_ROWS=100
 const REQUEST_TIMEOUT_MS=15_000
 const TRUSTED_HTTP_BASE_URL='https://app.catsco.cc'
 const configSchema=z.object({version:z.literal(1),transport:z.literal('catsco-bot-preflight-v1'),httpBaseUrl:z.string().min(1),expectedBotUid:z.string().regex(/^[1-9]\d*$/),controllerUid:z.literal('602').default('602'),apiKeyFile:z.string().min(1)}).strict()
@@ -31,20 +31,29 @@ export function assertConfiguredControllerOwner(ownerUid:string):void {
   if (ownerUid!==loadConfig().controllerUid) throw new ArgumentError('preflight packet ownerUid does not match configured Controller UID')
 }
 
-/** Read exactly one Bot-authenticated native Controller Action; no local packet input or polling loop. */
+/** Read one bounded Bot-authenticated history window and mechanically select its sole Controller Action. */
 export async function readNativePreflightPacket(receivedTopic:string):Promise<unknown>{
   if(!/^grp_[1-9]\d*$/.test(receivedTopic))throw new ArgumentError('received-topic must be a numeric CatsCo group topic')
   const c=loadConfig(),key=apiKey(c);await authenticated(c,key)
-  const response=record(await request(key,`/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=1`,{method:'GET'}),'native Action message')
-  if(!Array.isArray(response.messages)||response.messages.length!==1)throw new CommandExecutionError('CatsCo Bot API did not return exactly one native Action message')
-  const row=record(response.messages[0],'native Action message')
-  if(String(row.topic_id??'')!==receivedTopic)throw new CommandExecutionError('native Action message topic is invalid')
-  if(String(row.from_uid??row.from??'')!==c.controllerUid)throw new CommandExecutionError('native Action message Controller sender is invalid')
-  if(!/^\d+$/.test(String(row.id??''))||String(row.id)!==String(row.seq_id??''))throw new CommandExecutionError('native Action message id/seq is invalid')
-  if(String(row.type??'')!=='text'||String(row.msg_type??'text')!=='text')throw new CommandExecutionError('native Action message type is invalid')
-  for(const actor of [row.actor_uid,row.actorUid,row.metadata&&typeof row.metadata==='object'?(row.metadata as Record<string,unknown>).actor_uid:undefined]) if(actor!==undefined&&String(actor)!==c.controllerUid)throw new CommandExecutionError('native Action message actor is invalid')
-  const raw=row.content
-  try{return typeof raw==='string'?JSON.parse(raw):JSON.parse(canonicalJson(raw))}catch{throw new CommandExecutionError('native Action message content is not a JSON packet')}
+  // A Worker naturally writes planning/tool messages to its execution topic before it invokes this
+  // command. `limit=1` therefore selects Worker chatter rather than the Controller Action. This
+  // remains one bounded read, never a poll: choose the unique, strictly-formed Controller row.
+  const response=record(await request(key,`/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=${MAX_HISTORY_ROWS}`,{method:'GET'}),'native Action history')
+  if(!Array.isArray(response.messages)||response.messages.length===0||response.messages.length>MAX_HISTORY_ROWS)throw new CommandExecutionError('CatsCo Bot API returned invalid native Action history')
+  const candidates:unknown[]=[]
+  for(const rawRow of response.messages){
+    const row=record(rawRow,'native Action message')
+    if(String(row.topic_id??'')!==receivedTopic)throw new CommandExecutionError('native Action message topic is invalid')
+    if(!/^\d+$/.test(String(row.id??''))||String(row.id)!==String(row.seq_id??''))throw new CommandExecutionError('native Action message id/seq is invalid')
+    if(String(row.type??'')!=='text'||String(row.msg_type??'text')!=='text')throw new CommandExecutionError('native Action message type is invalid')
+    const sender=String(row.from_uid??row.from??'')
+    if(sender===c.expectedBotUid)continue
+    if(sender!==c.controllerUid)throw new CommandExecutionError('native Action message sender is invalid')
+    for(const actor of [row.actor_uid,row.actorUid,row.metadata&&typeof row.metadata==='object'?(row.metadata as Record<string,unknown>).actor_uid:undefined]) if(actor!==undefined&&String(actor)!==c.controllerUid)throw new CommandExecutionError('native Action message actor is invalid')
+    try{candidates.push(typeof row.content==='string'?JSON.parse(row.content):JSON.parse(canonicalJson(row.content)))}catch{throw new CommandExecutionError('native Action message content is not a JSON packet')}
+  }
+  if(candidates.length!==1)throw new CommandExecutionError(`CatsCo Bot API found ${candidates.length} eligible native Controller Action messages; expected exactly one`)
+  return candidates[0]
 }
 function isExactLatestReceipt(row:Record<string,unknown>,receipt:BotPreflightReceipt,expectedUid:string,content:string):boolean{if(String(row.id??'')!==receipt.messageId||String(row.seq_id??'')!==receipt.seqId||String(row.topic_id??'')!==receipt.topicId||String(row.from_uid??row.from??'')!==expectedUid||String(row.type??'')!=='worker_ready')return false;try{return canonicalJson(row.content)===content}catch{return false}}
-export async function sendBotPreflightEvidence(topicId:string,content:string,clientMsgId:string,expectedUid:string,beforeSend?:()=>void):Promise<BotPreflightReceipt>{const c=loadConfig();if(c.expectedBotUid!==expectedUid)throw new ArgumentError('Bot preflight config identity does not match signed packet principal');const key=apiKey(c);await authenticated(c,key);beforeSend?.();const sent=record(await request(key,'/api/messages/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic_id:topicId,client_msg_id:clientMsgId,content,msg_type:'text',type:'text'})}),'send receipt');const receipt={messageId:String(sent.id??''),topicId:String(sent.topic_id??''),clientMsgId:String(sent.client_msg_id??''),seqId:String(sent.seq_id??''),duplicate:sent.duplicate===true,contentDigest:contentDigest(content)};if(!receipt.messageId||!receipt.seqId||receipt.messageId!==receipt.seqId||receipt.topicId!==topicId||String(sent.from_uid??'')!==expectedUid||receipt.clientMsgId!==clientMsgId)throw new CommandExecutionError('CatsCo Bot API send receipt failed verification');const history=record(await request(key,`/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`,{method:'GET'}),'message receipt');if(!Array.isArray(history.messages)||history.messages.length===0||history.messages.length>MAX_RECEIPT_HISTORY)throw new CommandExecutionError('CatsCo Bot API returned invalid latest message receipt');const newest=record(history.messages.at(-1),'message receipt');if(!isExactLatestReceipt(newest,receipt,expectedUid,content))throw new CommandExecutionError('CatsCo Bot API receipt was not server-confirmed');return receipt}
+export async function sendBotPreflightEvidence(topicId:string,content:string,clientMsgId:string,expectedUid:string,beforeSend?:()=>void):Promise<BotPreflightReceipt>{const c=loadConfig();if(c.expectedBotUid!==expectedUid)throw new ArgumentError('Bot preflight config identity does not match signed packet principal');const key=apiKey(c);await authenticated(c,key);beforeSend?.();const sent=record(await request(key,'/api/messages/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic_id:topicId,client_msg_id:clientMsgId,content,msg_type:'text',type:'text'})}),'send receipt');const receipt={messageId:String(sent.id??''),topicId:String(sent.topic_id??''),clientMsgId:String(sent.client_msg_id??''),seqId:String(sent.seq_id??''),duplicate:sent.duplicate===true,contentDigest:contentDigest(content)};if(!receipt.messageId||!receipt.seqId||receipt.messageId!==receipt.seqId||receipt.topicId!==topicId||String(sent.from_uid??'')!==expectedUid||receipt.clientMsgId!==clientMsgId)throw new CommandExecutionError('CatsCo Bot API send receipt failed verification');const history=record(await request(key,`/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_HISTORY_ROWS}`,{method:'GET'}),'message receipt');if(!Array.isArray(history.messages)||history.messages.length===0||history.messages.length>MAX_HISTORY_ROWS)throw new CommandExecutionError('CatsCo Bot API returned invalid latest message receipt');const newest=record(history.messages.at(-1),'message receipt');if(!isExactLatestReceipt(newest,receipt,expectedUid,content))throw new CommandExecutionError('CatsCo Bot API receipt was not server-confirmed');return receipt}

@@ -165,7 +165,7 @@ import { z as z4 } from "zod";
 var MAX_CONFIG_BYTES = 16 * 1024;
 var MAX_KEY_BYTES = 8 * 1024;
 var MAX_RESPONSE_BYTES = 128 * 1024;
-var MAX_RECEIPT_HISTORY = 100;
+var MAX_HISTORY_ROWS = 100;
 var REQUEST_TIMEOUT_MS = 15e3;
 var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
 var configSchema = z4.object({ version: z4.literal(1), transport: z4.literal("catsco-bot-preflight-v1"), httpBaseUrl: z4.string().min(1), expectedBotUid: z4.string().regex(/^[1-9]\d*$/), controllerUid: z4.literal("602").default("602"), apiKeyFile: z4.string().min(1) }).strict();
@@ -270,20 +270,26 @@ async function readNativePreflightPacket(receivedTopic) {
   if (!/^grp_[1-9]\d*$/.test(receivedTopic)) throw new ArgumentError("received-topic must be a numeric CatsCo group topic");
   const c = loadConfig(), key = apiKey(c);
   await authenticated(c, key);
-  const response = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=1`, { method: "GET" }), "native Action message");
-  if (!Array.isArray(response.messages) || response.messages.length !== 1) throw new CommandExecutionError3("CatsCo Bot API did not return exactly one native Action message");
-  const row2 = record(response.messages[0], "native Action message");
-  if (String(row2.topic_id ?? "") !== receivedTopic) throw new CommandExecutionError3("native Action message topic is invalid");
-  if (String(row2.from_uid ?? row2.from ?? "") !== c.controllerUid) throw new CommandExecutionError3("native Action message Controller sender is invalid");
-  if (!/^\d+$/.test(String(row2.id ?? "")) || String(row2.id) !== String(row2.seq_id ?? "")) throw new CommandExecutionError3("native Action message id/seq is invalid");
-  if (String(row2.type ?? "") !== "text" || String(row2.msg_type ?? "text") !== "text") throw new CommandExecutionError3("native Action message type is invalid");
-  for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
-  const raw = row2.content;
-  try {
-    return typeof raw === "string" ? JSON.parse(raw) : JSON.parse(canonicalJson(raw));
-  } catch {
-    throw new CommandExecutionError3("native Action message content is not a JSON packet");
+  const response = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "native Action history");
+  if (!Array.isArray(response.messages) || response.messages.length === 0 || response.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid native Action history");
+  const candidates = [];
+  for (const rawRow of response.messages) {
+    const row2 = record(rawRow, "native Action message");
+    if (String(row2.topic_id ?? "") !== receivedTopic) throw new CommandExecutionError3("native Action message topic is invalid");
+    if (!/^\d+$/.test(String(row2.id ?? "")) || String(row2.id) !== String(row2.seq_id ?? "")) throw new CommandExecutionError3("native Action message id/seq is invalid");
+    if (String(row2.type ?? "") !== "text" || String(row2.msg_type ?? "text") !== "text") throw new CommandExecutionError3("native Action message type is invalid");
+    const sender = String(row2.from_uid ?? row2.from ?? "");
+    if (sender === c.expectedBotUid) continue;
+    if (sender !== c.controllerUid) throw new CommandExecutionError3("native Action message sender is invalid");
+    for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
+    try {
+      candidates.push(typeof row2.content === "string" ? JSON.parse(row2.content) : JSON.parse(canonicalJson(row2.content)));
+    } catch {
+      throw new CommandExecutionError3("native Action message content is not a JSON packet");
+    }
   }
+  if (candidates.length !== 1) throw new CommandExecutionError3(`CatsCo Bot API found ${candidates.length} eligible native Controller Action messages; expected exactly one`);
+  return candidates[0];
 }
 function isExactLatestReceipt(row2, receipt, expectedUid, content) {
   if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== "worker_ready") return false;
@@ -302,8 +308,8 @@ async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedU
   const sent = record(await request(key, "/api/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic_id: topicId, client_msg_id: clientMsgId, content, msg_type: "text", type: "text" }) }), "send receipt");
   const receipt = { messageId: String(sent.id ?? ""), topicId: String(sent.topic_id ?? ""), clientMsgId: String(sent.client_msg_id ?? ""), seqId: String(sent.seq_id ?? ""), duplicate: sent.duplicate === true, contentDigest: contentDigest(content) };
   if (!receipt.messageId || !receipt.seqId || receipt.messageId !== receipt.seqId || receipt.topicId !== topicId || String(sent.from_uid ?? "") !== expectedUid || receipt.clientMsgId !== clientMsgId) throw new CommandExecutionError3("CatsCo Bot API send receipt failed verification");
-  const history = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`, { method: "GET" }), "message receipt");
-  if (!Array.isArray(history.messages) || history.messages.length === 0 || history.messages.length > MAX_RECEIPT_HISTORY) throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
+  const history = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "message receipt");
+  if (!Array.isArray(history.messages) || history.messages.length === 0 || history.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
   const newest = record(history.messages.at(-1), "message receipt");
   if (!isExactLatestReceipt(newest, receipt, expectedUid, content)) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
   return receipt;

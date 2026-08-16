@@ -266,7 +266,7 @@ async function authenticated(c, key) {
 function assertConfiguredControllerOwner(ownerUid) {
   if (ownerUid !== loadConfig().controllerUid) throw new ArgumentError("preflight packet ownerUid does not match configured Controller UID");
 }
-async function readNativePreflightPacket(receivedTopic) {
+async function readNativeActionPacket(receivedTopic, expectedKind) {
   if (!/^grp_[1-9]\d*$/.test(receivedTopic)) throw new ArgumentError("received-topic must be a numeric CatsCo group topic");
   const c = loadConfig(), key = apiKey(c);
   await authenticated(c, key);
@@ -282,14 +282,20 @@ async function readNativePreflightPacket(receivedTopic) {
     if (sender === c.expectedBotUid) continue;
     if (sender !== c.controllerUid) throw new CommandExecutionError3("native Action message sender is invalid");
     for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
+    let packet;
     try {
-      candidates.push(typeof row2.content === "string" ? JSON.parse(row2.content) : JSON.parse(canonicalJson(row2.content)));
+      packet = typeof row2.content === "string" ? JSON.parse(row2.content) : JSON.parse(canonicalJson(row2.content));
     } catch {
       throw new CommandExecutionError3("native Action message content is not a JSON packet");
     }
+    if (!packet || typeof packet !== "object" || Array.isArray(packet) || typeof packet.kind !== "string") throw new CommandExecutionError3("native Action message content is not an Action packet");
+    if (packet.kind === expectedKind) candidates.push(packet);
   }
-  if (candidates.length !== 1) throw new CommandExecutionError3(`CatsCo Bot API found ${candidates.length} eligible native Controller Action messages; expected exactly one`);
+  if (candidates.length !== 1) throw new CommandExecutionError3(`CatsCo Bot API found ${candidates.length} eligible native Controller ${expectedKind} Action messages; expected exactly one`);
   return candidates[0];
+}
+async function readNativePreflightPacket(receivedTopic) {
+  return readNativeActionPacket(receivedTopic, "preflight_attempt");
 }
 function isExactLatestReceipt(row2, receipt, expectedUid, content) {
   if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== "worker_ready") return false;

@@ -6,6 +6,8 @@ import { ArgumentError } from '@jackwener/opencli/errors'
 import { z } from 'zod'
 import type { WorkerPreflightPacket } from './schemas.js'
 
+type SignedControllerPacket=Pick<WorkerPreflightPacket,'ownerUid'|'controllerKeyId'|'controllerPublicKey'|'controllerSignatureAlgorithm'|'packetDigest'|'controllerSignature'>
+
 const SIGNING_ALGORITHM='ed25519'
 const MAX_TRUSTED_KEYS_BYTES=64*1024
 const trustedControllerKeysSchema=z.object({
@@ -72,7 +74,7 @@ function readTrustedKeysFile(path: string): string {
   }
 }
 
-function trustedKey(packet: WorkerPreflightPacket): TrustedControllerKey {
+function trustedKey(packet: SignedControllerPacket): TrustedControllerKey {
   let config: z.infer<typeof trustedControllerKeysSchema>
   try {
     config=trustedControllerKeysSchema.parse(JSON.parse(readTrustedKeysFile(trustedKeysPath())))
@@ -96,7 +98,7 @@ function trustedKey(packet: WorkerPreflightPacket): TrustedControllerKey {
 }
 
 /** Verify Controller's digest projection and exact Ed25519 signature bytes against a local pin. */
-export function verifyTrustedControllerPreflightPacket(packet: WorkerPreflightPacket): void {
+export function verifyTrustedControllerPreflightPacket(packet: SignedControllerPacket): void {
   if (packet.controllerSignatureAlgorithm!==SIGNING_ALGORITHM) throw new ArgumentError('preflight packet Controller signature algorithm is invalid')
   if (packet.controllerKeyId!==controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError('preflight packet Controller key ID does not match its public key')
   trustedKey(packet)

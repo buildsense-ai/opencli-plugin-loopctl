@@ -31,8 +31,8 @@ export function assertConfiguredControllerOwner(ownerUid:string):void {
   if (ownerUid!==loadConfig().controllerUid) throw new ArgumentError('preflight packet ownerUid does not match configured Controller UID')
 }
 
-/** Read one bounded Bot-authenticated history window and mechanically select its sole Controller Action. */
-export async function readNativePreflightPacket(receivedTopic:string):Promise<unknown>{
+/** Read one bounded Bot-authenticated history window and mechanically select its sole Controller Action of the requested kind. */
+export async function readNativeActionPacket(receivedTopic:string, expectedKind:'preflight_attempt'|'execute_attempt'):Promise<unknown>{
   if(!/^grp_[1-9]\d*$/.test(receivedTopic))throw new ArgumentError('received-topic must be a numeric CatsCo group topic')
   const c=loadConfig(),key=apiKey(c);await authenticated(c,key)
   // A Worker naturally writes planning/tool messages to its execution topic before it invokes this
@@ -50,10 +50,16 @@ export async function readNativePreflightPacket(receivedTopic:string):Promise<un
     if(sender===c.expectedBotUid)continue
     if(sender!==c.controllerUid)throw new CommandExecutionError('native Action message sender is invalid')
     for(const actor of [row.actor_uid,row.actorUid,row.metadata&&typeof row.metadata==='object'?(row.metadata as Record<string,unknown>).actor_uid:undefined]) if(actor!==undefined&&String(actor)!==c.controllerUid)throw new CommandExecutionError('native Action message actor is invalid')
-    try{candidates.push(typeof row.content==='string'?JSON.parse(row.content):JSON.parse(canonicalJson(row.content)))}catch{throw new CommandExecutionError('native Action message content is not a JSON packet')}
+    let packet:unknown
+    try{packet=typeof row.content==='string'?JSON.parse(row.content):JSON.parse(canonicalJson(row.content))}catch{throw new CommandExecutionError('native Action message content is not a JSON packet')}
+    if(!packet||typeof packet!=='object'||Array.isArray(packet)||typeof (packet as Record<string,unknown>).kind!=='string')throw new CommandExecutionError('native Action message content is not an Action packet')
+    if((packet as Record<string,unknown>).kind===expectedKind)candidates.push(packet)
   }
-  if(candidates.length!==1)throw new CommandExecutionError(`CatsCo Bot API found ${candidates.length} eligible native Controller Action messages; expected exactly one`)
+  if(candidates.length!==1)throw new CommandExecutionError(`CatsCo Bot API found ${candidates.length} eligible native Controller ${expectedKind} Action messages; expected exactly one`)
   return candidates[0]
 }
+
+/** Compatibility wrapper for the preflight-only receipt path. */
+export async function readNativePreflightPacket(receivedTopic:string):Promise<unknown>{return readNativeActionPacket(receivedTopic,'preflight_attempt')}
 function isExactLatestReceipt(row:Record<string,unknown>,receipt:BotPreflightReceipt,expectedUid:string,content:string):boolean{if(String(row.id??'')!==receipt.messageId||String(row.seq_id??'')!==receipt.seqId||String(row.topic_id??'')!==receipt.topicId||String(row.from_uid??row.from??'')!==expectedUid||String(row.type??'')!=='worker_ready')return false;try{return canonicalJson(row.content)===content}catch{return false}}
 export async function sendBotPreflightEvidence(topicId:string,content:string,clientMsgId:string,expectedUid:string,beforeSend?:()=>void):Promise<BotPreflightReceipt>{const c=loadConfig();if(c.expectedBotUid!==expectedUid)throw new ArgumentError('Bot preflight config identity does not match signed packet principal');const key=apiKey(c);await authenticated(c,key);beforeSend?.();const sent=record(await request(key,'/api/messages/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic_id:topicId,client_msg_id:clientMsgId,content,msg_type:'text',type:'text'})}),'send receipt');const receipt={messageId:String(sent.id??''),topicId:String(sent.topic_id??''),clientMsgId:String(sent.client_msg_id??''),seqId:String(sent.seq_id??''),duplicate:sent.duplicate===true,contentDigest:contentDigest(content)};if(!receipt.messageId||!receipt.seqId||receipt.messageId!==receipt.seqId||receipt.topicId!==topicId||String(sent.from_uid??'')!==expectedUid||receipt.clientMsgId!==clientMsgId)throw new CommandExecutionError('CatsCo Bot API send receipt failed verification');const history=record(await request(key,`/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_HISTORY_ROWS}`,{method:'GET'}),'message receipt');if(!Array.isArray(history.messages)||history.messages.length===0||history.messages.length>MAX_HISTORY_ROWS)throw new CommandExecutionError('CatsCo Bot API returned invalid latest message receipt');const newest=record(history.messages.at(-1),'message receipt');if(!isExactLatestReceipt(newest,receipt,expectedUid,content))throw new CommandExecutionError('CatsCo Bot API receipt was not server-confirmed');return receipt}

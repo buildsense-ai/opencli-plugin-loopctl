@@ -4,7 +4,7 @@ import { actionPacketSchema, receiptSchema, statusSchema, tickSchema, workerPref
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
 import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
-import { assertConfiguredControllerOwner, readNativePreflightPacket, sendBotPreflightEvidence } from './catsco-bot-preflight.js'
+import { assertConfiguredControllerOwner, readNativeActionPacket, readNativePreflightPacket, sendBotPreflightEvidence } from './catsco-bot-preflight.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
 import { verifyTrustedControllerPreflightPacket } from './controller-provenance.js'
@@ -233,16 +233,28 @@ export async function integrate(kwargs:any){
   return {inputCount:plan.inputs.length,receipts,tick:await tick()}
 }
 export async function workspacePrepare(kwargs:any){
-  let packet: unknown
-  try { packet=JSON.parse(await readConfinedFile(String(kwargs['packet-file']))) }
-  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid execute packet file') }
+  if(kwargs['packet-file']!==undefined) throw new ArgumentError('packet-file is not supported; workspace-prepare reads the native Bot-authenticated Action')
+  const receivedTopic=String(kwargs['received-topic']??'')
+  let packet: ReturnType<typeof actionPacketSchema.parse>
+  try { packet=actionPacketSchema.parse(await readNativeActionPacket(receivedTopic,'execute_attempt')) }
+  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid native Controller execute packet') }
+  if(packet.kind!=='execute_attempt'||packet.action.kind!=='execute_attempt'||packet.action.state!=='ready') throw new ArgumentError('native Controller execute packet is not a ready execute_attempt')
+  const raw=packet as unknown as WorkerAttemptPacket
+  assertConfiguredControllerOwner(raw.ownerUid)
+  verifyTrustedControllerPreflightPacket(raw)
+  validateWorkerExecutePacket(raw,receivedTopic)
   return prepareWorkspaceFromPacket(packet)
+}
+
+type WorkerAttemptPacket=Omit<WorkerPreflightPacket,'kind'|'action'> & {
+  kind:'preflight_attempt'|'execute_attempt'
+  action:Omit<WorkerPreflightPacket['action'],'kind'> & {kind:'preflight_attempt'|'execute_attempt'}
 }
 
 const numericCatscoPrincipal=/^catsco-user:([1-9]\d*)$/
 const numericGroupTopic=/^grp_[1-9]\d*$/
 const stableId=(prefix:string,parts:string[])=>`${prefix}:${createHash('sha256').update(parts.join('\u0000')).digest('hex')}`
-function assertFutureLease(packet: WorkerPreflightPacket) {
+function assertFutureLease(packet: Pick<WorkerPreflightPacket,'leaseExpiresAt'>) {
   if (Date.parse(packet.leaseExpiresAt)<=Date.now()) throw new ArgumentError('preflight packet leaseExpiresAt must be in the future')
 }
 
@@ -269,6 +281,17 @@ function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTo
   }
   const sessionId=`session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`
   if (packet.workerSessionId!==sessionId) throw new ArgumentError('preflight packet workerSessionId is not the canonical Worker session')
+}
+
+function validateWorkerExecutePacket(packet: WorkerAttemptPacket, receivedTopic: string) {
+  assertFutureLease(packet)
+  const principalMatch=numericCatscoPrincipal.exec(packet.runtimePrincipal)
+  if (!principalMatch) throw new ArgumentError('execute packet runtime principal must be a numeric CatsCo Bot principal')
+  const principal=`catsco-user:${principalMatch[1]}`
+  if (!numericGroupTopic.test(receivedTopic)||!/^\d+$/.test(packet.catscoProjectId)) throw new ArgumentError('execute packet route is invalid')
+  if (packet.actionId!==packet.action.id || packet.actionKey!==packet.action.key || packet.kind!=='execute_attempt' || packet.action.kind!=='execute_attempt' || packet.action.state!=='ready' || packet.workItemRevision!==packet.action.workItemRevision || packet.targetPrincipal!==packet.action.targetPrincipal || packet.targetTopicId!==packet.action.targetTopicId || packet.targetDigest!==packet.action.targetDigest) throw new ArgumentError('execute packet action duplicates do not agree')
+  if (packet.targetPrincipal!==principal || packet.runtimePrincipal!==principal || packet.targetTopicId!==receivedTopic || packet.workerTopicId!==receivedTopic) throw new ArgumentError('execute packet target/runtime route does not match the native Worker topic')
+  if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId===receivedTopic || packet.workerSessionId!==`session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`) throw new ArgumentError('execute packet evidence route or Worker session is invalid')
 }
 
 /** Mechanically emit only the receipt-attested worker_ready event for a native preflight packet. */

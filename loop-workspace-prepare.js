@@ -145,50 +145,155 @@ function canonicalJson(value) {
 var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 
 // src/lib/loopctl.ts
-import { constants as fsConstants } from "node:fs";
-import { realpath, lstat, open } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
 import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
 var MAX_INPUT = 512 * 1024;
 var jsonValue = z3.unknown();
-async function readConfinedFile(file) {
-  if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
-  const cwd = resolve(process.cwd());
-  const requested = resolve(cwd, file);
-  const info = await lstat(requested);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("input file must be a regular non-symlink file");
-  const actual = await realpath(requested);
-  const rel = relative(cwd, actual);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
-  const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    const stat2 = await handle.stat();
-    if (!stat2.isFile()) throw new Error("input file must remain a regular file");
-    const value = await handle.readFile("utf8");
-    if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
-    return value;
-  } finally {
-    await handle.close();
-  }
-}
 
 // src/lib/catsco.ts
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
 
 // src/lib/catsco-bot-preflight.ts
+import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
 import { z as z4 } from "zod";
 var MAX_CONFIG_BYTES = 16 * 1024;
 var MAX_KEY_BYTES = 8 * 1024;
 var MAX_RESPONSE_BYTES = 128 * 1024;
+var MAX_HISTORY_ROWS = 100;
+var REQUEST_TIMEOUT_MS = 15e3;
+var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
 var configSchema = z4.object({ version: z4.literal(1), transport: z4.literal("catsco-bot-preflight-v1"), httpBaseUrl: z4.string().min(1), expectedBotUid: z4.string().regex(/^[1-9]\d*$/), controllerUid: z4.literal("602").default("602"), apiKeyFile: z4.string().min(1) }).strict();
+function configuredPath() {
+  return process.env.LOOPCTL_BOT_PREFLIGHT_CONFIG?.trim() || join(homedir(), ".config", "loopctl", "catsco-bot-preflight.json");
+}
+function secureRead(path, maxBytes, label) {
+  let fd;
+  try {
+    const before = lstatSync(path);
+    if (before.isSymbolicLink() || !before.isFile()) throw new Error(`${label} must be a regular file`);
+    if ((before.mode & 511) !== 384) throw new Error(`${label} must have mode 0600`);
+    if (typeof process.getuid === "function" && before.uid !== process.getuid()) throw new Error(`${label} must be owned by the current user`);
+    if (before.size > maxBytes) throw new Error(`${label} is too large`);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const after = fstatSync(fd);
+    if (!after.isFile() || (after.mode & 511) !== 384 || after.size > maxBytes || after.dev !== before.dev || after.ino !== before.ino || typeof process.getuid === "function" && after.uid !== process.getuid()) throw new Error(`${label} changed while opening or is unsafe`);
+    return readFileSync(fd, "utf8");
+  } finally {
+    if (fd !== void 0) closeSync(fd);
+  }
+}
+function loadConfig() {
+  try {
+    const c = configSchema.parse(JSON.parse(secureRead(configuredPath(), MAX_CONFIG_BYTES, "Bot preflight config")));
+    const u = new URL(c.httpBaseUrl);
+    if (c.httpBaseUrl !== TRUSTED_HTTP_BASE_URL || u.protocol !== "https:" || u.hostname !== "app.catsco.cc" || u.port || u.username || u.password || u.pathname !== "/" || u.search || u.hash) throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
+    if (!c.apiKeyFile.startsWith("/")) throw new Error("apiKeyFile must be an absolute path");
+    return c;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight configuration is unavailable or invalid: ${e instanceof Error ? e.message : "invalid configuration"}`);
+  }
+}
+function apiKey(c) {
+  try {
+    const v = secureRead(c.apiKeyFile, MAX_KEY_BYTES, "Bot preflight API key").trim();
+    if (!v || /[\r\n\0]/.test(v)) throw new Error("Bot preflight API key is invalid");
+    return v;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight API key is unavailable or invalid: ${e instanceof Error ? e.message : "invalid key"}`);
+  }
+}
+async function boundedResponseText(r) {
+  if (!r.body) throw new CommandExecutionError3("CatsCo Bot API response body is unavailable");
+  const reader = r.body.getReader(), chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const n = await reader.read();
+      if (n.done) break;
+      bytes += n.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => void 0);
+        throw new CommandExecutionError3("CatsCo Bot API response is too large");
+      }
+      chunks.push(n.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const c of chunks) {
+    all.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+async function request(key, path, init) {
+  const c = new AbortController(), timer = setTimeout(() => c.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${TRUSTED_HTTP_BASE_URL}${path}`, { ...init, redirect: "error", signal: c.signal, headers: { Authorization: `ApiKey ${key}`, ...init.headers } });
+    const text = await boundedResponseText(r);
+    if (!r.ok) throw new CommandExecutionError3(`CatsCo Bot API request failed with HTTP ${r.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new CommandExecutionError3("CatsCo Bot API returned invalid JSON");
+    }
+  } catch (e) {
+    if (e instanceof CommandExecutionError3) throw e;
+    throw new CommandExecutionError3(`CatsCo Bot API request failed: ${e instanceof Error ? e.name : "network error"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function record(v, label) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new CommandExecutionError3(`CatsCo Bot API returned invalid ${label}`);
+  return v;
+}
+async function authenticated(c, key) {
+  const me = record(await request(key, "/api/me", { method: "GET" }), "identity");
+  if (String(me.uid ?? "") !== c.expectedBotUid || String(me.account_type ?? "").toLowerCase() !== "bot") throw new CommandExecutionError3("CatsCo Bot API identity does not match configured Worker Bot");
+}
+function assertConfiguredControllerOwner(ownerUid) {
+  if (ownerUid !== loadConfig().controllerUid) throw new ArgumentError("preflight packet ownerUid does not match configured Controller UID");
+}
+async function readNativeActionPacket(receivedTopic, expectedKind) {
+  if (!/^grp_[1-9]\d*$/.test(receivedTopic)) throw new ArgumentError("received-topic must be a numeric CatsCo group topic");
+  const c = loadConfig(), key = apiKey(c);
+  await authenticated(c, key);
+  const response = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=${MAX_HISTORY_ROWS}`, { method: "GET" }), "native Action history");
+  if (!Array.isArray(response.messages) || response.messages.length === 0 || response.messages.length > MAX_HISTORY_ROWS) throw new CommandExecutionError3("CatsCo Bot API returned invalid native Action history");
+  const candidates = [];
+  for (const rawRow of response.messages) {
+    const row2 = record(rawRow, "native Action message");
+    if (String(row2.topic_id ?? "") !== receivedTopic) throw new CommandExecutionError3("native Action message topic is invalid");
+    if (!/^\d+$/.test(String(row2.id ?? "")) || String(row2.id) !== String(row2.seq_id ?? "")) throw new CommandExecutionError3("native Action message id/seq is invalid");
+    if (String(row2.type ?? "") !== "text" || String(row2.msg_type ?? "text") !== "text") throw new CommandExecutionError3("native Action message type is invalid");
+    const sender = String(row2.from_uid ?? row2.from ?? "");
+    if (sender === c.expectedBotUid) continue;
+    if (sender !== c.controllerUid) throw new CommandExecutionError3("native Action message sender is invalid");
+    for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
+    let packet;
+    try {
+      packet = typeof row2.content === "string" ? JSON.parse(row2.content) : JSON.parse(canonicalJson(row2.content));
+    } catch {
+      throw new CommandExecutionError3("native Action message content is not a JSON packet");
+    }
+    if (!packet || typeof packet !== "object" || Array.isArray(packet) || typeof packet.kind !== "string") throw new CommandExecutionError3("native Action message content is not an Action packet");
+    if (packet.kind === expectedKind) candidates.push(packet);
+  }
+  if (candidates.length !== 1) throw new CommandExecutionError3(`CatsCo Bot API found ${candidates.length} eligible native Controller ${expectedKind} Action messages; expected exactly one`);
+  return candidates[0];
+}
 
 // src/lib/exclusive-lock.ts
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open as open2, readFile, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 var DEFAULT_STALE_MS = 15 * 6e4;
 function staleMs() {
@@ -208,13 +313,13 @@ function processIsAlive(pid) {
 async function canReclaim(path) {
   const timeout = staleMs();
   const metadata = await stat(path);
-  let record = {};
+  let record2 = {};
   try {
-    record = JSON.parse(await readFile(path, "utf8"));
+    record2 = JSON.parse(await readFile(path, "utf8"));
   } catch {
   }
-  const created = Date.parse(typeof record.createdAt === "string" ? record.createdAt : metadata.mtime.toISOString());
-  const pid = Number(record.pid);
+  const created = Date.parse(typeof record2.createdAt === "string" ? record2.createdAt : metadata.mtime.toISOString());
+  const pid = Number(record2.pid);
   if (Number.isSafeInteger(pid) && pid > 0) return !processIsAlive(pid);
   const age = Number.isFinite(created) ? Date.now() - created : Number.POSITIVE_INFINITY;
   return age >= timeout;
@@ -224,10 +329,10 @@ async function acquireExclusiveLock(path, label) {
   const token = randomUUID();
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const handle = await open2(path, "wx", 384);
-      const record = { schema: "loopctl-exclusive-lock-v1", token, pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      const handle = await open(path, "wx", 384);
+      const record2 = { schema: "loopctl-exclusive-lock-v1", token, pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
       try {
-        await handle.writeFile(`${JSON.stringify(record)}
+        await handle.writeFile(`${JSON.stringify(record2)}
 `, "utf8");
         await handle.sync();
         await chmod(path, 384);
@@ -258,9 +363,9 @@ async function acquireExclusiveLock(path, label) {
 
 // src/lib/workspace.ts
 import { createHash, randomUUID as randomUUID2 } from "node:crypto";
-import { chmod as chmod2, lstat as lstat2, mkdir as mkdir2, readFile as readFile2, realpath as realpath2, rename, writeFile as writeFile2 } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join, normalize, relative as relative2, resolve as resolve2 } from "node:path";
+import { chmod as chmod2, lstat, mkdir as mkdir2, readFile as readFile2, realpath, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname2, isAbsolute, join as join2, normalize, relative, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 import { z as z5 } from "zod";
@@ -274,7 +379,7 @@ var packetSchema = z5.object({
 var MAX_OUTPUT3 = 128 * 1024;
 var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 function workspaceRegistryDirectory() {
-  return resolve2(process.env.LOOPCTL_WORKSPACE_REGISTRY_DIR?.trim() || join(homedir(), ".local", "state", "loopctl", "workspaces"));
+  return resolve(process.env.LOOPCTL_WORKSPACE_REGISTRY_DIR?.trim() || join2(homedir2(), ".local", "state", "loopctl", "workspaces"));
 }
 async function git(gitDir, args) {
   return await new Promise((resolveResult, reject) => {
@@ -313,22 +418,22 @@ function contractFromInstructions(instructions) {
   }
 }
 function normalizedAbsolute(path, label) {
-  if (!isAbsolute2(path) || normalize(path) !== path) throw new CommandExecutionError4(`${label} must be normalized and absolute`);
-  return resolve2(path);
+  if (!isAbsolute(path) || normalize(path) !== path) throw new CommandExecutionError4(`${label} must be normalized and absolute`);
+  return resolve(path);
 }
 function registeredWorktree(list, path, branch) {
-  const records = list.split("\n\n").map((record) => Object.fromEntries(record.split("\n").map((line) => {
+  const records = list.split("\n\n").map((record2) => Object.fromEntries(record2.split("\n").map((line) => {
     const index = line.indexOf(" ");
     return index < 0 ? [line, ""] : [line.slice(0, index), line.slice(index + 1)];
   })));
-  return records.some((record) => record.worktree === path && record.branch === `refs/heads/${branch}`);
+  return records.some((record2) => record2.worktree === path && record2.branch === `refs/heads/${branch}`);
 }
 async function claimLease(value) {
   const directory = workspaceRegistryDirectory();
   await mkdir2(directory, { recursive: true, mode: 448 });
   await chmod2(directory, 448);
   const key = digest({ workspaceLease: value.workspaceLease });
-  const path = join(directory, `${key}.json`);
+  const path = join2(directory, `${key}.json`);
   const lock = await acquireExclusiveLock(`${path}.lock`, `workspace lease ${String(value.workspaceLease)}`);
   try {
     const expectedDigest = digest(value);
@@ -361,17 +466,17 @@ async function prepareWorkspaceFromPacket(raw) {
   const worktreePath = normalizedAbsolute(contract.worktreePath, "worktreePath");
   const gitDir = normalizedAbsolute(contract.gitDir, "gitDir");
   if (!contract.branchName.startsWith(`loop/${packet.loopId}/`)) throw new CommandExecutionError4("worktree branch must be scoped to the packet loopId");
-  if (worktreePath === gitDir || relative2(gitDir, worktreePath) === "") throw new CommandExecutionError4("worktreePath must differ from gitDir");
+  if (worktreePath === gitDir || relative(gitDir, worktreePath) === "") throw new CommandExecutionError4("worktreePath must differ from gitDir");
   const baseRevision = await git(gitDir, ["rev-parse", `${contract.baseRevision}^{commit}`]);
   const contractDigest = digest(contract);
   const lease = await claimLease({ worktreePath, gitDir, branchName: contract.branchName, baseRevision, workspaceLease: contract.workspaceLease, contractDigest });
   let state;
   try {
     try {
-      const stat2 = await lstat2(worktreePath);
+      const stat2 = await lstat(worktreePath);
       if (!stat2.isDirectory() || stat2.isSymbolicLink()) throw new CommandExecutionError4("existing worktreePath is not a regular directory");
       const list = await git(gitDir, ["worktree", "list", "--porcelain"]);
-      const actualWorktreePath = await realpath2(worktreePath);
+      const actualWorktreePath = await realpath(worktreePath);
       if (!registeredWorktree(list, actualWorktreePath, contract.branchName)) {
         throw new CommandExecutionError4("existing worktreePath is not registered to the required branch");
       }
@@ -406,34 +511,147 @@ async function prepareWorkspaceFromPacket(raw) {
 }
 
 // src/lib/controller-provenance.ts
+import { createHash as createHash2, createPublicKey, verify } from "node:crypto";
+import { closeSync as closeSync2, constants as constants2, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readFileSync as readFileSync2 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { join as join3 } from "node:path";
 import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
 import { z as z6 } from "zod";
+var SIGNING_ALGORITHM = "ed25519";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
 var trustedControllerKeysSchema = z6.object({
   version: z6.literal(1),
   keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
+function controllerCanonicalJson(value) {
+  return JSON.stringify(normalize2(value));
+}
+function normalize2(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("canonical JSON rejects non-finite numbers");
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (Array.isArray(value)) return value.map(normalize2);
+  if (typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) {
+      const item = value[key];
+      if (item !== void 0) result[key] = normalize2(item);
+    }
+    return result;
+  }
+  throw new TypeError(`canonical JSON rejects ${typeof value}`);
+}
+function controllerKeyId(publicKey) {
+  return `controller-ed25519:${createHash2("sha256").update(publicKey).digest("base64url")}`;
+}
+function defaultTrustedKeysPath() {
+  return join3(homedir3(), ".config", "loopctl", "trusted-controller-keys.json");
+}
+function trustedKeysPath() {
+  const configured = process.env.LOOPCTL_TRUSTED_CONTROLLER_KEYS_FILE?.trim();
+  return configured || defaultTrustedKeysPath();
+}
+function readTrustedKeysFile(path) {
+  let descriptor;
+  try {
+    const pathStats = lstatSync2(path);
+    if (pathStats.isSymbolicLink()) throw new Error("trusted Controller key file must not be a symbolic link");
+    if (!pathStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((pathStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    descriptor = openSync2(path, constants2.O_RDONLY | constants2.O_NOFOLLOW);
+    const descriptorStats = fstatSync2(descriptor);
+    if (!descriptorStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((descriptorStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    if (descriptorStats.size > MAX_TRUSTED_KEYS_BYTES) throw new Error("trusted Controller key file is too large");
+    if (typeof process.getuid === "function" && descriptorStats.uid !== process.getuid()) throw new Error("trusted Controller key file must be owned by the current user");
+    if (descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino) throw new Error("trusted Controller key file changed while opening");
+    return readFileSync2(descriptor, "utf8");
+  } finally {
+    if (descriptor !== void 0) closeSync2(descriptor);
+  }
+}
+function trustedKey(packet) {
+  let config;
+  try {
+    config = trustedControllerKeysSchema.parse(JSON.parse(readTrustedKeysFile(trustedKeysPath())));
+    const identities = /* @__PURE__ */ new Set();
+    for (const key of config.keys) {
+      const identity = `${key.ownerUid}\0${key.controllerKeyId}`;
+      if (identities.has(identity)) throw new Error("trusted Controller key configuration has duplicate owner/key entries");
+      identities.add(identity);
+      if (key.controllerKeyId !== controllerKeyId(key.publicKey)) throw new Error("trusted Controller key configuration has an invalid key ID");
+      if (createPublicKey(key.publicKey).asymmetricKeyType !== SIGNING_ALGORITHM) throw new Error("trusted Controller key configuration has a non-Ed25519 public key");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "invalid configuration";
+    throw new ArgumentError2(`trusted Controller key configuration is unavailable or invalid: ${detail}`);
+  }
+  const matches = config.keys.filter((key) => key.ownerUid === packet.ownerUid && key.controllerKeyId === packet.controllerKeyId);
+  if (matches.length !== 1) throw new ArgumentError2("preflight packet Controller key is not pinned for its owner");
+  const pin = matches[0];
+  if (pin.publicKey !== packet.controllerPublicKey) throw new ArgumentError2("preflight packet Controller public key does not match its trusted pin");
+  return pin;
+}
+function verifyTrustedControllerPreflightPacket(packet) {
+  if (packet.controllerSignatureAlgorithm !== SIGNING_ALGORITHM) throw new ArgumentError2("preflight packet Controller signature algorithm is invalid");
+  if (packet.controllerKeyId !== controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError2("preflight packet Controller key ID does not match its public key");
+  trustedKey(packet);
+  const { controllerSignature: _signature, packetDigest, ...withoutDigest } = packet;
+  const expectedDigest = createHash2("sha256").update(controllerCanonicalJson(withoutDigest)).digest("hex");
+  if (packetDigest !== expectedDigest) throw new ArgumentError2("preflight packet packetDigest does not match the canonical Controller action packet");
+  const { controllerSignature: _ignoredSignature, ...signaturePayload } = packet;
+  try {
+    const verified = verify(null, Buffer.from(controllerCanonicalJson(signaturePayload)), createPublicKey(packet.controllerPublicKey), Buffer.from(packet.controllerSignature, "base64"));
+    if (!verified) throw new Error("signature mismatch");
+  } catch {
+    throw new ArgumentError2("preflight packet Controller signature is invalid");
+  }
+}
 
 // src/lib/commands.ts
 async function workspacePrepare(kwargs) {
+  if (kwargs["packet-file"] !== void 0) throw new ArgumentError3("packet-file is not supported; workspace-prepare reads the native Bot-authenticated Action");
+  const receivedTopic = String(kwargs["received-topic"] ?? "");
   let packet;
   try {
-    packet = JSON.parse(await readConfinedFile(String(kwargs["packet-file"])));
+    packet = actionPacketSchema.parse(await readNativeActionPacket(receivedTopic, "execute_attempt"));
   } catch (error) {
-    throw new ArgumentError3(error instanceof Error ? error.message : "invalid execute packet file");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid native Controller execute packet");
   }
+  if (packet.kind !== "execute_attempt" || packet.action.kind !== "execute_attempt" || packet.action.state !== "ready") throw new ArgumentError3("native Controller execute packet is not a ready execute_attempt");
+  const raw = packet;
+  assertConfiguredControllerOwner(raw.ownerUid);
+  verifyTrustedControllerPreflightPacket(raw);
+  validateWorkerExecutePacket(raw, receivedTopic);
   return prepareWorkspaceFromPacket(packet);
+}
+var numericCatscoPrincipal = /^catsco-user:([1-9]\d*)$/;
+var numericGroupTopic = /^grp_[1-9]\d*$/;
+function assertFutureLease(packet) {
+  if (Date.parse(packet.leaseExpiresAt) <= Date.now()) throw new ArgumentError3("preflight packet leaseExpiresAt must be in the future");
+}
+function validateWorkerExecutePacket(packet, receivedTopic) {
+  assertFutureLease(packet);
+  const principalMatch = numericCatscoPrincipal.exec(packet.runtimePrincipal);
+  if (!principalMatch) throw new ArgumentError3("execute packet runtime principal must be a numeric CatsCo Bot principal");
+  const principal = `catsco-user:${principalMatch[1]}`;
+  if (!numericGroupTopic.test(receivedTopic) || !/^\d+$/.test(packet.catscoProjectId)) throw new ArgumentError3("execute packet route is invalid");
+  if (packet.actionId !== packet.action.id || packet.actionKey !== packet.action.key || packet.kind !== "execute_attempt" || packet.action.kind !== "execute_attempt" || packet.action.state !== "ready" || packet.workItemRevision !== packet.action.workItemRevision || packet.targetPrincipal !== packet.action.targetPrincipal || packet.targetTopicId !== packet.action.targetTopicId || packet.targetDigest !== packet.action.targetDigest) throw new ArgumentError3("execute packet action duplicates do not agree");
+  if (packet.targetPrincipal !== principal || packet.runtimePrincipal !== principal || packet.targetTopicId !== receivedTopic || packet.workerTopicId !== receivedTopic) throw new ArgumentError3("execute packet target/runtime route does not match the native Worker topic");
+  if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId === receivedTopic || packet.workerSessionId !== `session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`) throw new ArgumentError3("execute packet evidence route or Worker session is invalid");
 }
 
 // loop-workspace-prepare.ts
 cli({
   site: "loop",
   name: "workspace-prepare",
-  description: "Worker-only: create and verify the exact fenced Git worktree from an execute packet",
+  description: "Worker-only: server-read the native execute packet and create the exact fenced Git worktree",
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,
-  args: [{ name: "packet-file", help: "Relative execute_attempt packet JSON file", required: true }],
+  args: [{ name: "received-topic", help: "Native received CatsCo grp_<id> topic", required: true }],
   columns: ["state", "worktreePath", "gitDir", "branchName", "baseRevision", "workspaceLease", "receiptDigest"],
   defaultFormat: "json",
   func: workspacePrepare

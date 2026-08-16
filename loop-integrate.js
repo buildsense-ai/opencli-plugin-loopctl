@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -280,28 +280,42 @@ var unwrap = (value) => {
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
 
+// src/lib/catsco-bot-preflight.ts
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
+import { z as z4 } from "zod";
+var MAX_CONFIG_BYTES = 16 * 1024;
+var MAX_KEY_BYTES = 8 * 1024;
+var MAX_RESPONSE_BYTES = 128 * 1024;
+var configSchema = z4.object({
+  version: z4.literal(1),
+  transport: z4.literal("catsco-bot-preflight-v1"),
+  httpBaseUrl: z4.string().min(1),
+  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
+  apiKeyFile: z4.string().min(1)
+}).strict();
+
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
 
 // src/lib/workspace.ts
-import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
-import { z as z4 } from "zod";
-var id3 = z4.string().min(1);
-var packetSchema = z4.object({
-  kind: z4.literal("execute_attempt"),
+import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var id3 = z5.string().min(1);
+var packetSchema = z5.object({
+  kind: z5.literal("execute_attempt"),
   loopId: id3,
   githubRepo: id3,
-  workBundle: z4.object({ instructions: id3 }).passthrough()
+  workBundle: z5.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
-import { ArgumentError } from "@jackwener/opencli/errors";
-import { z as z5 } from "zod";
+import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
+import { z as z6 } from "zod";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
-var trustedControllerKeysSchema = z5.object({
-  version: z5.literal(1),
-  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+var trustedControllerKeysSchema = z6.object({
+  version: z6.literal(1),
+  keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
 
 // src/lib/commands.ts
@@ -309,12 +323,12 @@ var parseResponse = (schema, value, label) => {
   try {
     return schema.parse(value);
   } catch {
-    throw new CommandExecutionError4(`loopctl returned malformed ${label} JSON`);
+    throw new CommandExecutionError5(`loopctl returned malformed ${label} JSON`);
   }
 };
 var assertAcceptedReceipt = (value) => {
   const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError2(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
+  if (receipt.status === "rejected") throw new ArgumentError3(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
   return receipt;
 };
 async function status(kwargs) {
@@ -334,10 +348,10 @@ async function integrate(kwargs) {
   try {
     plan = parseIntegrationPlan(await readConfinedFile(String(kwargs["plan-file"])));
   } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : "invalid integration plan");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid integration plan");
   }
   const integrationRegistration = plan.events[0];
-  if (integrationRegistration.type !== "work_item_registered") throw new ArgumentError2("integration plan must start with registration");
+  if (integrationRegistration.type !== "work_item_registered") throw new ArgumentError3("integration plan must start with registration");
   const current = await status({});
   const loopItems = current.workItems.filter((row2) => row2.loopId === integrationRegistration.payload.loopId && row2.workItemId !== integrationRegistration.payload.workItemId);
   const declared = new Set(plan.inputs.map((input) => input.workItemId));
@@ -350,7 +364,7 @@ async function integrate(kwargs) {
   const omitted = loopItems.filter((item) => !declared.has(item.workItemId));
   if (missing.length || unfinished.length || omitted.length) {
     const ids = [.../* @__PURE__ */ new Set([...missing.map((input) => input.workItemId), ...unfinished.map((item) => item.workItemId), ...omitted.map((item) => item.workItemId)])];
-    throw new ArgumentError2(`integration barrier is not satisfied for: ${ids.join(", ")}`);
+    throw new ArgumentError3(`integration barrier is not satisfied for: ${ids.join(", ")}`);
   }
   const receipts = [];
   for (const event of plan.events) receipts.push(await ingest(event));

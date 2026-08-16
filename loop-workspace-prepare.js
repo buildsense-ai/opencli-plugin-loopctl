@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -178,6 +178,20 @@ async function readConfinedFile(file) {
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
 
+// src/lib/catsco-bot-preflight.ts
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
+import { z as z4 } from "zod";
+var MAX_CONFIG_BYTES = 16 * 1024;
+var MAX_KEY_BYTES = 8 * 1024;
+var MAX_RESPONSE_BYTES = 128 * 1024;
+var configSchema = z4.object({
+  version: z4.literal(1),
+  transport: z4.literal("catsco-bot-preflight-v1"),
+  httpBaseUrl: z4.string().min(1),
+  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
+  apiKeyFile: z4.string().min(1)
+}).strict();
+
 // src/lib/exclusive-lock.ts
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open as open2, readFile, stat, unlink } from "node:fs/promises";
@@ -254,14 +268,14 @@ import { chmod as chmod2, lstat as lstat2, mkdir as mkdir2, readFile as readFile
 import { homedir } from "node:os";
 import { dirname as dirname2, isAbsolute as isAbsolute2, join, normalize, relative as relative2, resolve as resolve2 } from "node:path";
 import { spawn } from "node:child_process";
-import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
-import { z as z4 } from "zod";
-var id3 = z4.string().min(1);
-var packetSchema = z4.object({
-  kind: z4.literal("execute_attempt"),
+import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var id3 = z5.string().min(1);
+var packetSchema = z5.object({
+  kind: z5.literal("execute_attempt"),
   loopId: id3,
   githubRepo: id3,
-  workBundle: z4.object({ instructions: id3 }).passthrough()
+  workBundle: z5.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 var digest = (value) => createHash("sha256").update(canonicalJson(value)).digest("hex");
@@ -286,10 +300,10 @@ async function git(gitDir, args) {
         child.kill("SIGKILL");
       }
     });
-    child.on("error", (error) => reject(new CommandExecutionError3(`git workspace preparation unavailable: ${error.message}`)));
+    child.on("error", (error) => reject(new CommandExecutionError4(`git workspace preparation unavailable: ${error.message}`)));
     child.on("close", (code) => {
-      if (killed) return reject(new CommandExecutionError3("git workspace preparation produced too much output"));
-      if (code !== 0) return reject(new CommandExecutionError3(`git workspace preparation failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
+      if (killed) return reject(new CommandExecutionError4("git workspace preparation produced too much output"));
+      if (code !== 0) return reject(new CommandExecutionError4(`git workspace preparation failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
       resolveResult(stdout.trim());
     });
   });
@@ -297,15 +311,15 @@ async function git(gitDir, args) {
 function contractFromInstructions(instructions) {
   const marker = "LOOP_WORKTREE_CONTRACT_V1=";
   const lines = instructions.split("\n").filter((line) => line.startsWith(marker));
-  if (lines.length !== 1) throw new CommandExecutionError3("execute packet requires exactly one LOOP_WORKTREE_CONTRACT_V1 line");
+  if (lines.length !== 1) throw new CommandExecutionError4("execute packet requires exactly one LOOP_WORKTREE_CONTRACT_V1 line");
   try {
     return worktreeContractSchema.parse(JSON.parse(lines[0].slice(marker.length)));
   } catch {
-    throw new CommandExecutionError3("execute packet carries an invalid worktree contract");
+    throw new CommandExecutionError4("execute packet carries an invalid worktree contract");
   }
 }
 function normalizedAbsolute(path, label) {
-  if (!isAbsolute2(path) || normalize(path) !== path) throw new CommandExecutionError3(`${label} must be normalized and absolute`);
+  if (!isAbsolute2(path) || normalize(path) !== path) throw new CommandExecutionError4(`${label} must be normalized and absolute`);
   return resolve2(path);
 }
 function registeredWorktree(list, path, branch) {
@@ -326,7 +340,7 @@ async function claimLease(value) {
     const expectedDigest = digest(value);
     try {
       const current = JSON.parse(await readFile2(path, "utf8"));
-      if (current.digest !== expectedDigest) throw new CommandExecutionError3("workspace lease is already bound to a different contract");
+      if (current.digest !== expectedDigest) throw new CommandExecutionError4("workspace lease is already bound to a different contract");
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       const temporary = `${path}.${process.pid}.${randomUUID2()}.tmp`;
@@ -346,14 +360,14 @@ async function prepareWorkspaceFromPacket(raw) {
   try {
     packet = packetSchema.parse(raw);
   } catch {
-    throw new CommandExecutionError3("workspace-prepare requires an execute_attempt packet");
+    throw new CommandExecutionError4("workspace-prepare requires an execute_attempt packet");
   }
   const contract = contractFromInstructions(packet.workBundle.instructions);
-  if (!contract.gitDir) throw new CommandExecutionError3("worktree contract must include gitDir for workspace-prepare");
+  if (!contract.gitDir) throw new CommandExecutionError4("worktree contract must include gitDir for workspace-prepare");
   const worktreePath = normalizedAbsolute(contract.worktreePath, "worktreePath");
   const gitDir = normalizedAbsolute(contract.gitDir, "gitDir");
-  if (!contract.branchName.startsWith(`loop/${packet.loopId}/`)) throw new CommandExecutionError3("worktree branch must be scoped to the packet loopId");
-  if (worktreePath === gitDir || relative2(gitDir, worktreePath) === "") throw new CommandExecutionError3("worktreePath must differ from gitDir");
+  if (!contract.branchName.startsWith(`loop/${packet.loopId}/`)) throw new CommandExecutionError4("worktree branch must be scoped to the packet loopId");
+  if (worktreePath === gitDir || relative2(gitDir, worktreePath) === "") throw new CommandExecutionError4("worktreePath must differ from gitDir");
   const baseRevision = await git(gitDir, ["rev-parse", `${contract.baseRevision}^{commit}`]);
   const contractDigest = digest(contract);
   const lease = await claimLease({ worktreePath, gitDir, branchName: contract.branchName, baseRevision, workspaceLease: contract.workspaceLease, contractDigest });
@@ -361,14 +375,14 @@ async function prepareWorkspaceFromPacket(raw) {
   try {
     try {
       const stat2 = await lstat2(worktreePath);
-      if (!stat2.isDirectory() || stat2.isSymbolicLink()) throw new CommandExecutionError3("existing worktreePath is not a regular directory");
+      if (!stat2.isDirectory() || stat2.isSymbolicLink()) throw new CommandExecutionError4("existing worktreePath is not a regular directory");
       const list = await git(gitDir, ["worktree", "list", "--porcelain"]);
       const actualWorktreePath = await realpath2(worktreePath);
       if (!registeredWorktree(list, actualWorktreePath, contract.branchName)) {
-        throw new CommandExecutionError3("existing worktreePath is not registered to the required branch");
+        throw new CommandExecutionError4("existing worktreePath is not registered to the required branch");
       }
       const head = await git(worktreePath, ["rev-parse", "HEAD"]);
-      if (head !== baseRevision) throw new CommandExecutionError3("existing worktree HEAD does not match the contract base revision");
+      if (head !== baseRevision) throw new CommandExecutionError4("existing worktree HEAD does not match the contract base revision");
       state = "verified";
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -398,12 +412,12 @@ async function prepareWorkspaceFromPacket(raw) {
 }
 
 // src/lib/controller-provenance.ts
-import { ArgumentError } from "@jackwener/opencli/errors";
-import { z as z5 } from "zod";
+import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
+import { z as z6 } from "zod";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
-var trustedControllerKeysSchema = z5.object({
-  version: z5.literal(1),
-  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+var trustedControllerKeysSchema = z6.object({
+  version: z6.literal(1),
+  keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
 
 // src/lib/commands.ts
@@ -412,7 +426,7 @@ async function workspacePrepare(kwargs) {
   try {
     packet = JSON.parse(await readConfinedFile(String(kwargs["packet-file"])));
   } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : "invalid execute packet file");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid execute packet file");
   }
   return prepareWorkspaceFromPacket(packet);
 }

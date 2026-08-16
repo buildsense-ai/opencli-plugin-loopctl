@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -248,28 +248,42 @@ var unwrap = (value) => {
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
 
+// src/lib/catsco-bot-preflight.ts
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
+import { z as z4 } from "zod";
+var MAX_CONFIG_BYTES = 16 * 1024;
+var MAX_KEY_BYTES = 8 * 1024;
+var MAX_RESPONSE_BYTES = 128 * 1024;
+var configSchema = z4.object({
+  version: z4.literal(1),
+  transport: z4.literal("catsco-bot-preflight-v1"),
+  httpBaseUrl: z4.string().min(1),
+  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
+  apiKeyFile: z4.string().min(1)
+}).strict();
+
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
 
 // src/lib/workspace.ts
-import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
-import { z as z4 } from "zod";
-var id3 = z4.string().min(1);
-var packetSchema = z4.object({
-  kind: z4.literal("execute_attempt"),
+import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var id3 = z5.string().min(1);
+var packetSchema = z5.object({
+  kind: z5.literal("execute_attempt"),
   loopId: id3,
   githubRepo: id3,
-  workBundle: z4.object({ instructions: id3 }).passthrough()
+  workBundle: z5.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
-import { ArgumentError } from "@jackwener/opencli/errors";
-import { z as z5 } from "zod";
+import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
+import { z as z6 } from "zod";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
-var trustedControllerKeysSchema = z5.object({
-  version: z5.literal(1),
-  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+var trustedControllerKeysSchema = z6.object({
+  version: z6.literal(1),
+  keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
 
 // src/lib/commands.ts
@@ -277,12 +291,12 @@ var parseResponse = (schema, value, label) => {
   try {
     return schema.parse(value);
   } catch {
-    throw new CommandExecutionError4(`loopctl returned malformed ${label} JSON`);
+    throw new CommandExecutionError5(`loopctl returned malformed ${label} JSON`);
   }
 };
 var assertAcceptedReceipt = (value) => {
   const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError2(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
+  if (receipt.status === "rejected") throw new ArgumentError3(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
   return receipt;
 };
 async function ingest(event) {
@@ -296,18 +310,18 @@ var readPlan = async (file) => {
   try {
     return parsePlan(await readConfinedFile(file));
   } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : "invalid plan file");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid plan file");
   }
 };
 async function next(kwargs) {
   const actionId = String(kwargs["plan-next-action-id"] ?? "");
-  if (!actionId) throw new ArgumentError2("next requires --plan-next-action-id");
+  if (!actionId) throw new ArgumentError3("next requires --plan-next-action-id");
   const packet = parseResponse(actionPacketSchema, unwrap(await runLoopctl(["packet", "--action-id", actionId])), "packet");
-  if (packet.kind !== "plan_next" || !["accepted", "closed"].includes(packet.completedWorkItem.state) || !["ready", "satisfied"].includes(packet.action.state)) throw new ArgumentError2("plan_next action is stale or not current");
+  if (packet.kind !== "plan_next" || !["accepted", "closed"].includes(packet.completedWorkItem.state) || !["ready", "satisfied"].includes(packet.action.state)) throw new ArgumentError3("plan_next action is stale or not current");
   const events = await readPlan(String(kwargs["plan-file"]));
   const registration = events[0];
-  if (registration.payload.loopId !== packet.loopId) throw new ArgumentError2("next plan loopId does not match plan_next packet");
-  if (registration.payload.workItemId === packet.completedWorkItem.workItemId) throw new ArgumentError2("next plan must use a new Work Item ID");
+  if (registration.payload.loopId !== packet.loopId) throw new ArgumentError3("next plan loopId does not match plan_next packet");
+  if (registration.payload.workItemId === packet.completedWorkItem.workItemId) throw new ArgumentError3("next plan must use a new Work Item ID");
   const receipts = [];
   receipts.push(await ingest(events[0]));
   receipts.push(await ingest(events[1]));

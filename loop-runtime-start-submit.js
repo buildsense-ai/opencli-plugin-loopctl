@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -262,28 +262,42 @@ async function authenticatedCatscoUid() {
   return uid;
 }
 
+// src/lib/catsco-bot-preflight.ts
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
+import { z as z4 } from "zod";
+var MAX_CONFIG_BYTES = 16 * 1024;
+var MAX_KEY_BYTES = 8 * 1024;
+var MAX_RESPONSE_BYTES = 128 * 1024;
+var configSchema = z4.object({
+  version: z4.literal(1),
+  transport: z4.literal("catsco-bot-preflight-v1"),
+  httpBaseUrl: z4.string().min(1),
+  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
+  apiKeyFile: z4.string().min(1)
+}).strict();
+
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
 
 // src/lib/workspace.ts
-import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
-import { z as z4 } from "zod";
-var id3 = z4.string().min(1);
-var packetSchema = z4.object({
-  kind: z4.literal("execute_attempt"),
+import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var id3 = z5.string().min(1);
+var packetSchema = z5.object({
+  kind: z5.literal("execute_attempt"),
   loopId: id3,
   githubRepo: id3,
-  workBundle: z4.object({ instructions: id3 }).passthrough()
+  workBundle: z5.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
-import { ArgumentError } from "@jackwener/opencli/errors";
-import { z as z5 } from "zod";
+import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
+import { z as z6 } from "zod";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
-var trustedControllerKeysSchema = z5.object({
-  version: z5.literal(1),
-  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+var trustedControllerKeysSchema = z6.object({
+  version: z6.literal(1),
+  keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
 
 // src/lib/commands.ts
@@ -292,7 +306,7 @@ async function submitAttestedEvent(file, schema, label) {
   try {
     submission = schema.parse(JSON.parse(await readConfinedFile(file)));
   } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : `invalid ${label} submission file`);
+    throw new ArgumentError3(error instanceof Error ? error.message : `invalid ${label} submission file`);
   }
   const content = canonicalJson(submission.event);
   const event = JSON.parse(content);

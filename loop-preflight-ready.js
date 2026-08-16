@@ -2,8 +2,8 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { createHash as createHash2 } from "node:crypto";
-import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { createHash as createHash3 } from "node:crypto";
+import { ArgumentError as ArgumentError3, CommandExecutionError as CommandExecutionError5 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -175,159 +175,177 @@ async function readConfinedFile(file) {
 }
 
 // src/lib/catsco.ts
-import { spawn } from "node:child_process";
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
 var MAX_OUTPUT2 = 128 * 1024;
-var TIMEOUT_MS = 3e4;
-function unwrap(value) {
-  if (value && typeof value === "object" && "data" in value) return value.data;
+
+// src/lib/catsco-bot-preflight.ts
+import { createHash } from "node:crypto";
+import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { ArgumentError, CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
+import { z as z4 } from "zod";
+var MAX_CONFIG_BYTES = 16 * 1024;
+var MAX_KEY_BYTES = 8 * 1024;
+var MAX_RESPONSE_BYTES = 128 * 1024;
+var REQUEST_TIMEOUT_MS = 15e3;
+var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
+var configSchema = z4.object({
+  version: z4.literal(1),
+  transport: z4.literal("catsco-bot-preflight-v1"),
+  httpBaseUrl: z4.string().min(1),
+  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
+  apiKeyFile: z4.string().min(1)
+}).strict();
+function configuredPath() {
+  return process.env.LOOPCTL_BOT_PREFLIGHT_CONFIG?.trim() || join(homedir(), ".config", "loopctl", "catsco-bot-preflight.json");
+}
+function secureRead(path, maxBytes, label) {
+  let fd;
+  try {
+    const before = lstatSync(path);
+    if (before.isSymbolicLink() || !before.isFile()) throw new Error(`${label} must be a regular file`);
+    if ((before.mode & 511) !== 384) throw new Error(`${label} must have mode 0600`);
+    if (typeof process.getuid === "function" && before.uid !== process.getuid()) throw new Error(`${label} must be owned by the current user`);
+    if (before.size > maxBytes) throw new Error(`${label} is too large`);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const after = fstatSync(fd);
+    if (!after.isFile() || (after.mode & 511) !== 384 || after.size > maxBytes || after.dev !== before.dev || after.ino !== before.ino || typeof process.getuid === "function" && after.uid !== process.getuid()) throw new Error(`${label} changed while opening or is unsafe`);
+    return readFileSync(fd, "utf8");
+  } finally {
+    if (fd !== void 0) closeSync(fd);
+  }
+}
+function trustedHttpBaseUrl(value) {
+  const raw = value.trim();
+  if (raw !== TRUSTED_HTTP_BASE_URL && raw !== `${TRUSTED_HTTP_BASE_URL}/`) throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
+  const url = new URL(raw);
+  if (url.protocol !== "https:" || url.hostname !== "app.catsco.cc" || url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
+  }
+  return TRUSTED_HTTP_BASE_URL;
+}
+function loadConfig() {
+  try {
+    const config = configSchema.parse(JSON.parse(secureRead(configuredPath(), MAX_CONFIG_BYTES, "Bot preflight config")));
+    config.httpBaseUrl = trustedHttpBaseUrl(config.httpBaseUrl);
+    if (!config.apiKeyFile.startsWith("/")) throw new Error("apiKeyFile must be an absolute path");
+    return config;
+  } catch (error) {
+    throw new ArgumentError(`Bot preflight configuration is unavailable or invalid: ${error instanceof Error ? error.message : "invalid configuration"}`);
+  }
+}
+function apiKey(config) {
+  try {
+    const value = secureRead(config.apiKeyFile, MAX_KEY_BYTES, "Bot preflight API key").trim();
+    if (!value || /[\r\n\0]/.test(value)) throw new Error("Bot preflight API key is invalid");
+    return value;
+  } catch (error) {
+    throw new ArgumentError(`Bot preflight API key is unavailable or invalid: ${error instanceof Error ? error.message : "invalid key"}`);
+  }
+}
+async function boundedResponseText(response) {
+  if (!response.body) throw new CommandExecutionError3("CatsCo Bot API response body is unavailable");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value;
+      bytes += chunk.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => void 0);
+        throw new CommandExecutionError3("CatsCo Bot API response is too large");
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(combined);
+}
+async function request(key, path, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${TRUSTED_HTTP_BASE_URL}${path}`, { ...init, redirect: "error", signal: controller.signal, headers: { Authorization: `ApiKey ${key}`, ...init.headers } });
+    const text = await boundedResponseText(response);
+    if (!response.ok) throw new CommandExecutionError3(`CatsCo Bot API request failed with HTTP ${response.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new CommandExecutionError3("CatsCo Bot API returned invalid JSON");
+    }
+  } catch (error) {
+    if (error instanceof CommandExecutionError3) throw error;
+    throw new CommandExecutionError3(`CatsCo Bot API request failed: ${error instanceof Error ? error.name : "network error"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function record(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CommandExecutionError3(`CatsCo Bot API returned invalid ${label}`);
   return value;
 }
-function asRecord(value, label) {
-  const row2 = unwrap(value);
-  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2(`CatsCo ${label} returned a non-object`);
-  return row2;
+function contentDigest(content) {
+  return createHash("sha256").update(content).digest("hex");
 }
-function asIdentityRecord(value) {
-  const identity = unwrap(value);
-  const row2 = Array.isArray(identity) && identity.length === 1 ? identity[0] : identity;
-  if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo identity returned an invalid response");
-  return row2;
+function historyRows(value, topicId, sequence) {
+  const envelope = record(value, "message receipt");
+  if (String(envelope.topic_id ?? "") !== topicId || String(envelope.around_id ?? "") !== sequence || !Array.isArray(envelope.messages)) throw new CommandExecutionError3("CatsCo Bot API returned invalid exact message receipt");
+  return envelope.messages.map((row2) => record(row2, "message receipt"));
 }
-async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal, beforeSend) {
-  if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError2("attested event targetTopicId must be a CatsCo Attempt topic");
-  if (!clientMsgId.trim()) throw new CommandExecutionError2("attested event idempotencyKey is required");
-  const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1];
-  if (!expectedUid) throw new CommandExecutionError2("attested event source must be a numeric CatsCo principal");
-  const authenticatedUid = await authenticatedCatscoUid();
-  if (authenticatedUid !== expectedUid) throw new CommandExecutionError2("CatsCo authenticated sender does not match attested event source");
+async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedUid, beforeSend) {
+  const config = loadConfig();
+  if (config.expectedBotUid !== expectedUid) throw new ArgumentError("Bot preflight config identity does not match signed packet principal");
+  const key = apiKey(config);
+  const me = record(await request(key, "/api/me", { method: "GET" }), "identity");
+  if (String(me.uid ?? "") !== expectedUid || String(me.account_type ?? "").toLowerCase() !== "bot") throw new CommandExecutionError3("CatsCo Bot API identity does not match configured Worker Bot");
   beforeSend?.();
-  const sent = asRecord(await runOpenCli(["catsco", "send", topicId, content, "--client-message-id", clientMsgId, "--format", "json"]), "attested event send");
-  const receipt = {
-    messageId: String(sent.messageId ?? ""),
-    topicId: String(sent.topicId ?? ""),
-    clientMsgId: String(sent.clientMsgId ?? ""),
-    seqId: String(sent.seqId ?? ""),
-    duplicate: sent.duplicate === true,
-    contentDigest: String(sent.contentDigest ?? "")
-  };
-  if (!receipt.messageId || !receipt.seqId || receipt.topicId !== topicId || receipt.clientMsgId !== clientMsgId || !receipt.contentDigest) {
-    throw new CommandExecutionError2("CatsCo attested event send receipt failed verification");
-  }
-  const confirmed = asRecord(await runOpenCli(["catsco", "message-receipt", topicId, "--client-message-id", clientMsgId, "--format", "json"]), "attested event receipt");
-  if (confirmed.found !== true || confirmed.serverConfirmed !== true || String(confirmed.topicId ?? "") !== topicId || String(confirmed.clientMsgId ?? "") !== clientMsgId || String(confirmed.seqId ?? "") !== receipt.seqId || String(confirmed.contentDigest ?? "") !== receipt.contentDigest) {
-    throw new CommandExecutionError2("CatsCo attested event receipt was not server-confirmed");
-  }
+  const sent = record(await request(key, "/api/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic_id: topicId, client_msg_id: clientMsgId, content, msg_type: "text", type: "text" }) }), "send receipt");
+  const receipt = { messageId: String(sent.id ?? ""), topicId: String(sent.topic_id ?? ""), clientMsgId: String(sent.client_msg_id ?? ""), seqId: String(sent.seq_id ?? ""), duplicate: sent.duplicate === true, contentDigest: contentDigest(content) };
+  if (!receipt.messageId || !receipt.seqId || receipt.messageId !== receipt.seqId || receipt.topicId !== topicId || String(sent.from_uid ?? "") !== expectedUid || receipt.clientMsgId !== clientMsgId) throw new CommandExecutionError3("CatsCo Bot API send receipt failed verification");
+  const history = historyRows(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&around_id=${encodeURIComponent(receipt.seqId)}&limit=1`, { method: "GET" }), topicId, receipt.seqId);
+  const confirmed = history.find((row2) => String(row2.id ?? "") === receipt.messageId && String(row2.seq_id ?? "") === receipt.seqId && String(row2.topic_id ?? "") === topicId && String(row2.from_uid ?? row2.from ?? "") === expectedUid && String(row2.type ?? "") === "text" && String(row2.content ?? "") === content);
+  if (!confirmed) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
   return receipt;
-}
-async function runOpenCli(args) {
-  return await new Promise((resolve2, reject) => {
-    const child = spawn(process.env.OPENCLI_BINARY?.trim() || "opencli", args, { shell: false, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-    }, TIMEOUT_MS);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT2) {
-        killed = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk).slice(0, 4096);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(new CommandExecutionError2(`CatsCo provisioning unavailable: ${error.message}`));
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killed) return reject(new CommandExecutionError2("CatsCo provisioning timed out or produced too much output"));
-      if (code !== 0) return reject(new CommandExecutionError2(`CatsCo provisioning failed: ${stderr.trim().slice(0, 512) || `exit ${code ?? 1}`}`));
-      try {
-        resolve2(JSON.parse(stdout));
-      } catch {
-        reject(new CommandExecutionError2("CatsCo provisioning returned invalid JSON"));
-      }
-    });
-  });
-}
-async function authenticatedCatscoUid() {
-  const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
-  const uid = String(row2.uid ?? "");
-  if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
-  return uid;
-}
-function csv(value) {
-  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-}
-async function groupInfo(groupId) {
-  const row2 = asRecord(await runOpenCli(["catsco", "group-info", groupId, "--format", "json"]), "group topology");
-  const returnedGroupId = String(row2.groupId ?? "");
-  const topic = String(row2.topic ?? "");
-  const kind = String(row2.kind ?? "");
-  const agentIds = csv(row2.agentIds).sort();
-  const memberIds = csv(row2.memberIds).sort();
-  if (returnedGroupId !== groupId || topic !== `grp_${groupId}` || kind !== "standard" && kind !== "agent_task") {
-    throw new CommandExecutionError2("CatsCo group topology response did not bind the requested group");
-  }
-  return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
-}
-async function projectHasTopics(projectId, topics) {
-  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
-  const sessions = unwrap(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
-  if (!Array.isArray(sessions) || topics.some((topic) => !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic))) {
-    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain every Attempt topic");
-  }
-}
-async function verifyPreflightRoute(projectId, workerTopic, evidenceTopic, workerUid) {
-  if (!/^[1-9]\d*$/.test(workerUid) || !/^grp_[1-9]\d*$/.test(workerTopic) || !/^grp_[1-9]\d*$/.test(evidenceTopic) || workerTopic === evidenceTopic) {
-    throw new CommandExecutionError2("preflight route requires distinct numeric CatsCo group topics and Worker UID");
-  }
-  await projectHasTopics(projectId, [workerTopic, evidenceTopic]);
-  const workerGroup = await groupInfo(workerTopic.slice("grp_".length));
-  const evidenceGroup = await groupInfo(evidenceTopic.slice("grp_".length));
-  const workerAgentIds = workerGroup.agentIds.split(",").filter(Boolean);
-  const evidenceAgentIds = evidenceGroup.agentIds.split(",").filter(Boolean);
-  if (workerGroup.kind !== "agent_task" || workerAgentIds.length !== 1 || workerAgentIds[0] !== workerUid) {
-    throw new CommandExecutionError2("CatsCo execution group topology does not bind the authenticated Worker");
-  }
-  if (evidenceGroup.kind !== "standard" || !evidenceAgentIds.includes(workerUid)) {
-    throw new CommandExecutionError2("CatsCo evidence group topology does not include the authenticated Worker");
-  }
 }
 
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
 
 // src/lib/workspace.ts
-import { CommandExecutionError as CommandExecutionError3 } from "@jackwener/opencli/errors";
-import { z as z4 } from "zod";
-var id3 = z4.string().min(1);
-var packetSchema = z4.object({
-  kind: z4.literal("execute_attempt"),
+import { CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var id3 = z5.string().min(1);
+var packetSchema = z5.object({
+  kind: z5.literal("execute_attempt"),
   loopId: id3,
   githubRepo: id3,
-  workBundle: z4.object({ instructions: id3 }).passthrough()
+  workBundle: z5.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
-import { createHash, createPublicKey, verify } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { ArgumentError } from "@jackwener/opencli/errors";
-import { z as z5 } from "zod";
+import { createHash as createHash2, createPublicKey, verify } from "node:crypto";
+import { closeSync as closeSync2, constants as constants2, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readFileSync as readFileSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
+import { ArgumentError as ArgumentError2 } from "@jackwener/opencli/errors";
+import { z as z6 } from "zod";
 var SIGNING_ALGORITHM = "ed25519";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
-var trustedControllerKeysSchema = z5.object({
-  version: z5.literal(1),
-  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+var trustedControllerKeysSchema = z6.object({
+  version: z6.literal(1),
+  keys: z6.array(z6.object({ ownerUid: z6.string().min(1), controllerKeyId: z6.string().min(1), publicKey: z6.string().min(1) }).strict())
 }).strict();
 function controllerCanonicalJson(value) {
   return JSON.stringify(normalize(value));
@@ -350,10 +368,10 @@ function normalize(value) {
   throw new TypeError(`canonical JSON rejects ${typeof value}`);
 }
 function controllerKeyId(publicKey) {
-  return `controller-ed25519:${createHash("sha256").update(publicKey).digest("base64url")}`;
+  return `controller-ed25519:${createHash2("sha256").update(publicKey).digest("base64url")}`;
 }
 function defaultTrustedKeysPath() {
-  return join(homedir(), ".config", "loopctl", "trusted-controller-keys.json");
+  return join2(homedir2(), ".config", "loopctl", "trusted-controller-keys.json");
 }
 function trustedKeysPath() {
   const configured = process.env.LOOPCTL_TRUSTED_CONTROLLER_KEYS_FILE?.trim();
@@ -362,20 +380,20 @@ function trustedKeysPath() {
 function readTrustedKeysFile(path) {
   let descriptor;
   try {
-    const pathStats = lstatSync(path);
+    const pathStats = lstatSync2(path);
     if (pathStats.isSymbolicLink()) throw new Error("trusted Controller key file must not be a symbolic link");
     if (!pathStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
     if ((pathStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const descriptorStats = fstatSync(descriptor);
+    descriptor = openSync2(path, constants2.O_RDONLY | constants2.O_NOFOLLOW);
+    const descriptorStats = fstatSync2(descriptor);
     if (!descriptorStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
     if ((descriptorStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
     if (descriptorStats.size > MAX_TRUSTED_KEYS_BYTES) throw new Error("trusted Controller key file is too large");
     if (typeof process.getuid === "function" && descriptorStats.uid !== process.getuid()) throw new Error("trusted Controller key file must be owned by the current user");
     if (descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino) throw new Error("trusted Controller key file changed while opening");
-    return readFileSync(descriptor, "utf8");
+    return readFileSync2(descriptor, "utf8");
   } finally {
-    if (descriptor !== void 0) closeSync(descriptor);
+    if (descriptor !== void 0) closeSync2(descriptor);
   }
 }
 function trustedKey(packet) {
@@ -392,68 +410,69 @@ function trustedKey(packet) {
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : "invalid configuration";
-    throw new ArgumentError(`trusted Controller key configuration is unavailable or invalid: ${detail}`);
+    throw new ArgumentError2(`trusted Controller key configuration is unavailable or invalid: ${detail}`);
   }
   const matches = config.keys.filter((key) => key.ownerUid === packet.ownerUid && key.controllerKeyId === packet.controllerKeyId);
-  if (matches.length !== 1) throw new ArgumentError("preflight packet Controller key is not pinned for its owner");
+  if (matches.length !== 1) throw new ArgumentError2("preflight packet Controller key is not pinned for its owner");
   const pin = matches[0];
-  if (pin.publicKey !== packet.controllerPublicKey) throw new ArgumentError("preflight packet Controller public key does not match its trusted pin");
+  if (pin.publicKey !== packet.controllerPublicKey) throw new ArgumentError2("preflight packet Controller public key does not match its trusted pin");
   return pin;
 }
 function verifyTrustedControllerPreflightPacket(packet) {
-  if (packet.controllerSignatureAlgorithm !== SIGNING_ALGORITHM) throw new ArgumentError("preflight packet Controller signature algorithm is invalid");
-  if (packet.controllerKeyId !== controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError("preflight packet Controller key ID does not match its public key");
+  if (packet.controllerSignatureAlgorithm !== SIGNING_ALGORITHM) throw new ArgumentError2("preflight packet Controller signature algorithm is invalid");
+  if (packet.controllerKeyId !== controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError2("preflight packet Controller key ID does not match its public key");
   trustedKey(packet);
   const { controllerSignature: _signature, packetDigest, ...withoutDigest } = packet;
-  const expectedDigest = createHash("sha256").update(controllerCanonicalJson(withoutDigest)).digest("hex");
-  if (packetDigest !== expectedDigest) throw new ArgumentError("preflight packet packetDigest does not match the canonical Controller action packet");
+  const expectedDigest = createHash2("sha256").update(controllerCanonicalJson(withoutDigest)).digest("hex");
+  if (packetDigest !== expectedDigest) throw new ArgumentError2("preflight packet packetDigest does not match the canonical Controller action packet");
   const { controllerSignature: _ignoredSignature, ...signaturePayload } = packet;
   try {
     const verified = verify(null, Buffer.from(controllerCanonicalJson(signaturePayload)), createPublicKey(packet.controllerPublicKey), Buffer.from(packet.controllerSignature, "base64"));
     if (!verified) throw new Error("signature mismatch");
   } catch {
-    throw new ArgumentError("preflight packet Controller signature is invalid");
+    throw new ArgumentError2("preflight packet Controller signature is invalid");
   }
 }
 
 // src/lib/commands.ts
+var numericCatscoPrincipal = /^catsco-user:([1-9]\d*)$/;
 var numericGroupTopic = /^grp_[1-9]\d*$/;
-var stableId = (prefix, parts) => `${prefix}:${createHash2("sha256").update(parts.join("\0")).digest("hex")}`;
+var stableId = (prefix, parts) => `${prefix}:${createHash3("sha256").update(parts.join("\0")).digest("hex")}`;
 function assertFutureLease(packet) {
-  if (Date.parse(packet.leaseExpiresAt) <= Date.now()) throw new ArgumentError2("preflight packet leaseExpiresAt must be in the future");
+  if (Date.parse(packet.leaseExpiresAt) <= Date.now()) throw new ArgumentError3("preflight packet leaseExpiresAt must be in the future");
 }
-function validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid) {
+function validateWorkerPreflightPacket(packet, receivedTopic) {
   assertFutureLease(packet);
-  const principal = `catsco-user:${authenticatedUid}`;
-  if (!numericGroupTopic.test(receivedTopic)) throw new ArgumentError2("received-topic must be a numeric CatsCo group topic");
-  if (!/^[1-9]\d*$/.test(packet.catscoProjectId)) throw new ArgumentError2("preflight packet catscoProjectId must be numeric");
+  const principalMatch = numericCatscoPrincipal.exec(packet.runtimePrincipal);
+  if (!principalMatch) throw new ArgumentError3("preflight packet runtime principal must be a numeric CatsCo Bot principal");
+  const principal = `catsco-user:${principalMatch[1]}`;
+  if (!numericGroupTopic.test(receivedTopic)) throw new ArgumentError3("received-topic must be a numeric CatsCo group topic");
+  if (!/^[1-9]\d*$/.test(packet.catscoProjectId)) throw new ArgumentError3("preflight packet catscoProjectId must be numeric");
   if (packet.actionId !== packet.action.id || packet.actionKey !== packet.action.key || packet.kind !== packet.action.kind || packet.workItemRevision !== packet.action.workItemRevision || packet.targetPrincipal !== packet.action.targetPrincipal || packet.targetTopicId !== packet.action.targetTopicId || packet.targetDigest !== packet.action.targetDigest) {
-    throw new ArgumentError2("preflight packet action duplicates do not agree");
+    throw new ArgumentError3("preflight packet action duplicates do not agree");
   }
   if (packet.targetPrincipal !== principal || packet.runtimePrincipal !== principal) {
-    throw new ArgumentError2("preflight packet target/runtime principal does not match authenticated CatsCo Bot");
+    throw new ArgumentError3("preflight packet target/runtime principal does not match authenticated CatsCo Bot");
   }
   if (packet.targetTopicId !== receivedTopic || packet.workerTopicId !== receivedTopic) {
-    throw new ArgumentError2("preflight packet execution topic does not match received-topic");
+    throw new ArgumentError3("preflight packet execution topic does not match received-topic");
   }
   if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId === receivedTopic) {
-    throw new ArgumentError2("preflight packet evidenceTopicId must be a distinct numeric CatsCo group topic");
+    throw new ArgumentError3("preflight packet evidenceTopicId must be a distinct numeric CatsCo group topic");
   }
-  const sessionId = `session:v2:catscompany:group:${receivedTopic}:agent:${authenticatedUid}`;
-  if (packet.workerSessionId !== sessionId) throw new ArgumentError2("preflight packet workerSessionId is not the canonical Worker session");
+  const sessionId = `session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`;
+  if (packet.workerSessionId !== sessionId) throw new ArgumentError3("preflight packet workerSessionId is not the canonical Worker session");
 }
 async function preflightReady(kwargs) {
   let packet;
   try {
     packet = workerPreflightPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs["packet-file"]))));
   } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : "invalid preflight packet file");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid preflight packet file");
   }
   verifyTrustedControllerPreflightPacket(packet);
   const receivedTopic = String(kwargs["received-topic"] ?? "");
-  const authenticatedUid = await authenticatedCatscoUid();
-  validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid);
-  await verifyPreflightRoute(packet.catscoProjectId, packet.workerTopicId, packet.evidenceTopicId, authenticatedUid);
+  validateWorkerPreflightPacket(packet, receivedTopic);
   const parts = [packet.actionKey, "worker_ready", packet.attemptId, String(packet.generation), String(packet.workItemRevision), packet.workerSessionId];
   const event = workerReady.parse({
     type: "worker_ready",
@@ -472,7 +491,8 @@ async function preflightReady(kwargs) {
     }
   });
   const content = canonicalJson(event);
-  const receipt = await sendAttemptEvent(packet.evidenceTopicId, content, event.idempotencyKey, event.source, () => assertFutureLease(packet));
+  const botUid = numericCatscoPrincipal.exec(packet.runtimePrincipal)[1];
+  const receipt = await sendBotPreflightEvidence(packet.evidenceTopicId, content, event.idempotencyKey, botUid, () => assertFutureLease(packet));
   return { targetTopicId: packet.evidenceTopicId, event: JSON.parse(content), receipt };
 }
 

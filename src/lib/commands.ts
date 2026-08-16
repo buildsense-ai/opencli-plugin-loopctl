@@ -3,7 +3,8 @@ import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { actionPacketSchema, receiptSchema, statusSchema, tickSchema, workerPreflightPacketSchema, type WorkerPreflightPacket } from './schemas.js'
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
-import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent, verifyPreflightRoute } from './catsco.js'
+import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
+import { sendBotPreflightEvidence } from './catsco-bot-preflight.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
 import { verifyTrustedControllerPreflightPacket } from './controller-provenance.js'
@@ -245,9 +246,11 @@ function assertFutureLease(packet: WorkerPreflightPacket) {
   if (Date.parse(packet.leaseExpiresAt)<=Date.now()) throw new ArgumentError('preflight packet leaseExpiresAt must be in the future')
 }
 
-function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTopic: string, authenticatedUid: string) {
+function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTopic: string) {
   assertFutureLease(packet)
-  const principal=`catsco-user:${authenticatedUid}`
+  const principalMatch=numericCatscoPrincipal.exec(packet.runtimePrincipal)
+  if (!principalMatch) throw new ArgumentError('preflight packet runtime principal must be a numeric CatsCo Bot principal')
+  const principal=`catsco-user:${principalMatch[1]}`
   if (!numericGroupTopic.test(receivedTopic)) throw new ArgumentError('received-topic must be a numeric CatsCo group topic')
   if (!/^[1-9]\d*$/.test(packet.catscoProjectId)) throw new ArgumentError('preflight packet catscoProjectId must be numeric')
   if (packet.actionId!==packet.action.id || packet.actionKey!==packet.action.key || packet.kind!==packet.action.kind ||
@@ -264,7 +267,7 @@ function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTo
   if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId===receivedTopic) {
     throw new ArgumentError('preflight packet evidenceTopicId must be a distinct numeric CatsCo group topic')
   }
-  const sessionId=`session:v2:catscompany:group:${receivedTopic}:agent:${authenticatedUid}`
+  const sessionId=`session:v2:catscompany:group:${receivedTopic}:agent:${principalMatch[1]}`
   if (packet.workerSessionId!==sessionId) throw new ArgumentError('preflight packet workerSessionId is not the canonical Worker session')
 }
 
@@ -277,9 +280,12 @@ export async function preflightReady(kwargs:any) {
   // CatsCo or taking any action based on the self-carried packet fields.
   verifyTrustedControllerPreflightPacket(packet)
   const receivedTopic=String(kwargs['received-topic']??'')
-  const authenticatedUid=await authenticatedCatscoUid()
-  validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid)
-  await verifyPreflightRoute(packet.catscoProjectId, packet.workerTopicId, packet.evidenceTopicId, authenticatedUid)
+  // The Controller signature covers catscoProjectId, worker/evidence topics,
+  // principals, and duplicated action fields. Bot REST has no read-only
+  // Project/group topology endpoint, so this is the Controller's immutable
+  // topology-intent attestation; the Bot API independently enforces evidence
+  // topic authorization when it accepts the send.
+  validateWorkerPreflightPacket(packet, receivedTopic)
   const parts=[packet.actionKey,'worker_ready',packet.attemptId,String(packet.generation),String(packet.workItemRevision),packet.workerSessionId]
   const event=workerReady.parse({
     type:'worker_ready', eventId:stableId('loop-event',parts), idempotencyKey:stableId('loop-evidence',parts),
@@ -288,9 +294,10 @@ export async function preflightReady(kwargs:any) {
       runtimePrincipal:packet.runtimePrincipal,workerSessionId:packet.workerSessionId,signature:'catsco-message-attested'}
   })
   const content=canonicalJson(event)
-  // Recheck at the transport boundary because route verification can take long
-  // enough for an otherwise valid lease to expire.
-  const receipt=await sendAttemptEvent(packet.evidenceTopicId,content,event.idempotencyKey,event.source,()=>assertFutureLease(packet))
+  // Recheck lease freshness at the Bot transport boundary. This path never
+  // invokes OpenCLI or a human browser/session credential.
+  const botUid=numericCatscoPrincipal.exec(packet.runtimePrincipal)![1]
+  const receipt=await sendBotPreflightEvidence(packet.evidenceTopicId,content,event.idempotencyKey,botUid,()=>assertFutureLease(packet))
   return {targetTopicId:packet.evidenceTopicId,event:JSON.parse(content),receipt}
 }
 export async function bundleCommand(kwargs:any){const event=await readEvent(String(kwargs['event-file']),bundle);return {receipt:await ingest(event),tick:await tick()}}

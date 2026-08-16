@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -60,6 +60,42 @@ var recoveryPacket = z.object({ ...packetBase, kind: z.literal("recover_attempt"
 var reviewPacket = z.object({ ...packetBase, kind: z.literal("review_candidate"), loopId: id, profileId: id, githubRepo: id, stewardPrincipal: id, stewardTopicId: id, evidenceTopicId: id.optional(), acceptanceContractHash: hash, candidate: z.object({ candidateId: id, attemptId: id, generation: z.number().int().nonnegative(), deliverable: z.record(z.string(), z.unknown()), digest: hash, trustedEvidence: z.record(z.string(), z.unknown()) }).nullable() }).passthrough();
 var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId: id, profileId: id, terminalState: z.enum(["accepted", "closed"]), completedWorkItem: z.object({ workItemId: id, revision: z.number().int().positive(), state: z.enum(["accepted", "closed"]) }).strict(), currentCandidate: z.record(z.string(), z.unknown()).nullable(), outcomeContext: z.record(z.string(), z.unknown()) }).passthrough();
 var actionPacketSchema = z.discriminatedUnion("kind", [attemptPacket, recoveryPacket, reviewPacket, nextPacket]);
+var workerPreflightPacketSchema = z.object({
+  kind: z.literal("preflight_attempt"),
+  schema: z.literal("loopctl-action-packet-v1"),
+  actionId: id,
+  actionKey: id,
+  action: z.object({ id, key: id, kind: z.literal("preflight_attempt"), state: z.literal("ready"), workItemRevision: z.number().int().positive(), targetPrincipal: id, targetTopicId: id, targetDigest: hash }).strict(),
+  workItemId: id,
+  workItemRevision: z.number().int().positive(),
+  targetPrincipal: id,
+  targetTopicId: id,
+  targetDigest: hash,
+  packetDigest: hash,
+  contracts: z.object({ taskContractHash: hash, referenceSnapshotHash: hash, writeScopeHash: hash, acceptanceContractHash: hash }).strict(),
+  ownerUid: id,
+  loopId: id,
+  profileId: id,
+  catscoProjectId: id,
+  workerTopicId: id,
+  evidenceTopicId: id,
+  workerSessionId: id,
+  githubRepo: id,
+  writeScope: z.array(id),
+  attemptId: id,
+  attemptNumber: z.number().int().positive(),
+  generation: z.number().int().nonnegative(),
+  runtimePrincipal: id,
+  leaseExpiresAt: z.string().datetime(),
+  proofMode: z.literal("catsco-message"),
+  proofKeyId: id.optional(),
+  proofPublicKey: id.optional(),
+  controllerSignatureAlgorithm: z.literal("ed25519"),
+  controllerKeyId: id,
+  controllerPublicKey: z.string().min(1),
+  controllerSignature: z.string().min(1),
+  workBundle: z.object({ contractDigest: hash, instructions: id, deliverables: z.array(id) }).strict()
+}).strict();
 
 // src/lib/events.ts
 import { z as z2 } from "zod";
@@ -242,7 +278,7 @@ async function runOpenCli(args) {
     });
   });
 }
-async function currentCatscoUid() {
+async function authenticatedCatscoUid() {
   const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
   const uid = String(row2.uid ?? "");
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
@@ -264,7 +300,7 @@ async function groupInfo(groupId) {
   return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
 }
 async function createStandardTopic(name, memberUids) {
-  const ownerUid = await currentCatscoUid();
+  const ownerUid = await authenticatedCatscoUid();
   const requestedMemberUids = [...new Set(memberUids)].sort();
   const expectedMemberIds = [.../* @__PURE__ */ new Set([ownerUid, ...requestedMemberUids])].sort();
   const expectedAgentIds = requestedMemberUids.filter((uid) => uid !== ownerUid);
@@ -283,7 +319,7 @@ async function createStandardTopic(name, memberUids) {
   return { ...topology, kind: "standard" };
 }
 async function createAgentTaskTopic(name, workerAgentUid) {
-  const ownerUid = await currentCatscoUid();
+  const ownerUid = await authenticatedCatscoUid();
   if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError2("agent-task Worker UID must be numeric");
   if (!name || name.length > 180) throw new CommandExecutionError2("agent-task name is invalid");
   const value = await runOpenCli(["catsco", "group-create", name, workerAgentUid, "--kind", "agent_task", "--format", "json"]);
@@ -304,13 +340,17 @@ async function createAgentTaskTopic(name, workerAgentUid) {
   }
   return { groupId, topic, kind: "agent_task", agentIds };
 }
+async function projectHasTopics(projectId, topics) {
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
+  const sessions = unwrap2(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
+  if (!Array.isArray(sessions) || topics.some((topic) => !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic))) {
+    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain every Attempt topic");
+  }
+}
 async function attachTopicToProject(projectId, topic) {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
   await runOpenCli(["catsco", "project-assign-topic", projectId, topic, "--format", "json"]);
-  const sessions = unwrap2(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
-  if (!Array.isArray(sessions) || !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic)) {
-    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain the Attempt topic");
-  }
+  await projectHasTopics(projectId, [topic]);
 }
 
 // src/lib/provisioning-journal.ts
@@ -520,6 +560,15 @@ var packetSchema = z4.object({
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
+// src/lib/controller-provenance.ts
+import { ArgumentError } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
+var trustedControllerKeysSchema = z5.object({
+  version: z5.literal(1),
+  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+}).strict();
+
 // src/lib/commands.ts
 var parseResponse = (schema, value, label) => {
   try {
@@ -530,7 +579,7 @@ var parseResponse = (schema, value, label) => {
 };
 var assertAcceptedReceipt = (value) => {
   const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
+  if (receipt.status === "rejected") throw new ArgumentError2(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
   return receipt;
 };
 async function packet(kwargs) {
@@ -545,18 +594,18 @@ async function tick() {
 }
 function bundleInstructions(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.instructions !== "string") {
-    throw new ArgumentError(`${label} does not contain work bundle instructions`);
+    throw new ArgumentError2(`${label} does not contain work bundle instructions`);
   }
   return value.instructions;
 }
 function worktreeContract2(instructions, label) {
   const marker = "LOOP_WORKTREE_CONTRACT_V1=";
   const lines = instructions.split("\n").filter((line) => line.startsWith(marker));
-  if (lines.length !== 1) throw new ArgumentError(`${label} requires exactly one LOOP_WORKTREE_CONTRACT_V1 line`);
+  if (lines.length !== 1) throw new ArgumentError2(`${label} requires exactly one LOOP_WORKTREE_CONTRACT_V1 line`);
   try {
     return worktreeContractSchema.parse(JSON.parse(lines[0].slice(marker.length)));
   } catch {
-    throw new ArgumentError(`${label} worktree contract is invalid`);
+    throw new ArgumentError2(`${label} worktree contract is invalid`);
   }
 }
 async function agentTaskRetry(kwargs) {
@@ -567,25 +616,25 @@ async function agentTaskRetry(kwargs) {
     if (recoveryPacket2.kind !== "recover_attempt" || !["ready", "satisfied"].includes(recoveryPacket2.action.state)) throw new Error("recovery packet is stale or not actionable");
     retry = bundle.parse(JSON.parse(await readConfinedFile(String(kwargs["event-file"]))));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid recovery packet or bundle");
+    throw new ArgumentError2(error instanceof Error ? error.message : "invalid recovery packet or bundle");
   }
   const p = retry.payload;
-  if (p.workItemId !== recoveryPacket2.workItemId || p.expectedRevision !== recoveryPacket2.workItemRevision) throw new ArgumentError("recovery bundle does not bind the current Work Item revision");
-  if (p.generation !== recoveryPacket2.previousAttempt.generation + 1 || p.attemptNumber !== recoveryPacket2.previousAttempt.attemptNumber + 1) throw new ArgumentError("recovery bundle must use exactly the next generation and attempt number");
-  if (p.runtimePrincipal !== recoveryPacket2.previousAttempt.runtimePrincipal) throw new ArgumentError("recovery bundle runtime principal does not match the fenced predecessor");
-  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (p[key] !== recoveryPacket2.contracts[key]) throw new ArgumentError(`recovery bundle contract mismatch: ${key}`);
+  if (p.workItemId !== recoveryPacket2.workItemId || p.expectedRevision !== recoveryPacket2.workItemRevision) throw new ArgumentError2("recovery bundle does not bind the current Work Item revision");
+  if (p.generation !== recoveryPacket2.previousAttempt.generation + 1 || p.attemptNumber !== recoveryPacket2.previousAttempt.attemptNumber + 1) throw new ArgumentError2("recovery bundle must use exactly the next generation and attempt number");
+  if (p.runtimePrincipal !== recoveryPacket2.previousAttempt.runtimePrincipal) throw new ArgumentError2("recovery bundle runtime principal does not match the fenced predecessor");
+  for (const key of ["taskContractHash", "referenceSnapshotHash", "writeScopeHash", "acceptanceContractHash"]) if (p[key] !== recoveryPacket2.contracts[key]) throw new ArgumentError2(`recovery bundle contract mismatch: ${key}`);
   const worker = /^catsco-user:([1-9]\d*)$/.exec(p.runtimePrincipal);
   const reviewer = /^catsco-user:([1-9]\d*)$/.exec(recoveryPacket2.stewardPrincipal);
-  if (!worker || !reviewer || !/^\d+$/.test(recoveryPacket2.catscoProjectId)) throw new ArgumentError("recovery packet does not contain numeric CatsCo principals and Project");
+  if (!worker || !reviewer || !/^\d+$/.test(recoveryPacket2.catscoProjectId)) throw new ArgumentError2("recovery packet does not contain numeric CatsCo principals and Project");
   const previousWorktree = worktreeContract2(bundleInstructions(recoveryPacket2.previousAttempt.workBundle, "recovery packet"), "recovery packet");
   const nextWorktree = worktreeContract2(bundleInstructions(p.workBundle, "recovery bundle"), "recovery bundle");
-  if (!nextWorktree.gitDir) throw new ArgumentError("recovery bundle worktree contract requires gitDir for workspace-prepare");
+  if (!nextWorktree.gitDir) throw new ArgumentError2("recovery bundle worktree contract requires gitDir for workspace-prepare");
   if (previousWorktree.branchName === nextWorktree.branchName || previousWorktree.worktreePath === nextWorktree.worktreePath || previousWorktree.workspaceLease === nextWorktree.workspaceLease) {
-    throw new ArgumentError("recovery bundle must use a fresh branch, worktree path, and workspace lease");
+    throw new ArgumentError2("recovery bundle must use a fresh branch, worktree path, and workspace lease");
   }
   const current = await packet({ "action-id": recoveryPacket2.actionId });
   if (current.kind !== "recover_attempt" || current.packetDigest !== recoveryPacket2.packetDigest || !["ready", "satisfied"].includes(current.action.state)) {
-    throw new ArgumentError("recover_attempt packet is stale; no resources were provisioned");
+    throw new ArgumentError2("recover_attempt packet is stale; no resources were provisioned");
   }
   const journalStore = await openProvisionJournal("agent-task-retry", { packet: recoveryPacket2, retry });
   const asRecord2 = (topic) => ({
@@ -611,7 +660,7 @@ async function agentTaskRetry(kwargs) {
     journal = await journalStore.save({ phase: "topics_attached", projectId, workerTopic, evidenceTopic, reviewTopic });
     const coordinatorSessionId = String(recoveryPacket2.coordinatorSessionId ?? "");
     const coordinatorSessionTopicId = String(recoveryPacket2.coordinatorSessionTopicId ?? "");
-    if (!coordinatorSessionId || !coordinatorSessionTopicId) throw new ArgumentError("recover_attempt lacks the originating coordinator session route");
+    if (!coordinatorSessionId || !coordinatorSessionTopicId) throw new ArgumentError2("recover_attempt lacks the originating coordinator session route");
     const rewritten = { ...retry, payload: { ...p, attemptRoute: { catscoProjectId: projectId, workerTopicId: workerTopic.topic, evidenceTopicId: evidenceTopic.topic, stewardTopicId: reviewTopic.topic, stewardPrincipal: recoveryPacket2.stewardPrincipal, workerSessionId: `session:v2:catscompany:group:${workerTopic.topic}:agent:${worker[1]}`, coordinatorSessionId, coordinatorSessionTopicId } } };
     const bundleReceipt = journal.bundleReceipt ?? await ingest(rewritten);
     if (!journal.bundleReceipt) journal = await journalStore.save({ phase: "bundle_ingested", bundleReceipt });

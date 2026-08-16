@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -60,6 +60,42 @@ var recoveryPacket = z.object({ ...packetBase, kind: z.literal("recover_attempt"
 var reviewPacket = z.object({ ...packetBase, kind: z.literal("review_candidate"), loopId: id, profileId: id, githubRepo: id, stewardPrincipal: id, stewardTopicId: id, evidenceTopicId: id.optional(), acceptanceContractHash: hash, candidate: z.object({ candidateId: id, attemptId: id, generation: z.number().int().nonnegative(), deliverable: z.record(z.string(), z.unknown()), digest: hash, trustedEvidence: z.record(z.string(), z.unknown()) }).nullable() }).passthrough();
 var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId: id, profileId: id, terminalState: z.enum(["accepted", "closed"]), completedWorkItem: z.object({ workItemId: id, revision: z.number().int().positive(), state: z.enum(["accepted", "closed"]) }).strict(), currentCandidate: z.record(z.string(), z.unknown()).nullable(), outcomeContext: z.record(z.string(), z.unknown()) }).passthrough();
 var actionPacketSchema = z.discriminatedUnion("kind", [attemptPacket, recoveryPacket, reviewPacket, nextPacket]);
+var workerPreflightPacketSchema = z.object({
+  kind: z.literal("preflight_attempt"),
+  schema: z.literal("loopctl-action-packet-v1"),
+  actionId: id,
+  actionKey: id,
+  action: z.object({ id, key: id, kind: z.literal("preflight_attempt"), state: z.literal("ready"), workItemRevision: z.number().int().positive(), targetPrincipal: id, targetTopicId: id, targetDigest: hash }).strict(),
+  workItemId: id,
+  workItemRevision: z.number().int().positive(),
+  targetPrincipal: id,
+  targetTopicId: id,
+  targetDigest: hash,
+  packetDigest: hash,
+  contracts: z.object({ taskContractHash: hash, referenceSnapshotHash: hash, writeScopeHash: hash, acceptanceContractHash: hash }).strict(),
+  ownerUid: id,
+  loopId: id,
+  profileId: id,
+  catscoProjectId: id,
+  workerTopicId: id,
+  evidenceTopicId: id,
+  workerSessionId: id,
+  githubRepo: id,
+  writeScope: z.array(id),
+  attemptId: id,
+  attemptNumber: z.number().int().positive(),
+  generation: z.number().int().nonnegative(),
+  runtimePrincipal: id,
+  leaseExpiresAt: z.string().datetime(),
+  proofMode: z.literal("catsco-message"),
+  proofKeyId: id.optional(),
+  proofPublicKey: id.optional(),
+  controllerSignatureAlgorithm: z.literal("ed25519"),
+  controllerKeyId: id,
+  controllerPublicKey: z.string().min(1),
+  controllerSignature: z.string().min(1),
+  workBundle: z.object({ contractDigest: hash, instructions: id, deliverables: z.array(id) }).strict()
+}).strict();
 
 // src/lib/events.ts
 import { z as z2 } from "zod";
@@ -176,6 +212,15 @@ var packetSchema = z4.object({
   workBundle: z4.object({ instructions: id3 }).passthrough()
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
+
+// src/lib/controller-provenance.ts
+import { ArgumentError } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
+var trustedControllerKeysSchema = z5.object({
+  version: z5.literal(1),
+  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+}).strict();
 
 // src/lib/commands.ts
 var parseResponse = (schema, value, label) => {

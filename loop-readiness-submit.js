@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -60,6 +60,42 @@ var recoveryPacket = z.object({ ...packetBase, kind: z.literal("recover_attempt"
 var reviewPacket = z.object({ ...packetBase, kind: z.literal("review_candidate"), loopId: id, profileId: id, githubRepo: id, stewardPrincipal: id, stewardTopicId: id, evidenceTopicId: id.optional(), acceptanceContractHash: hash, candidate: z.object({ candidateId: id, attemptId: id, generation: z.number().int().nonnegative(), deliverable: z.record(z.string(), z.unknown()), digest: hash, trustedEvidence: z.record(z.string(), z.unknown()) }).nullable() }).passthrough();
 var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId: id, profileId: id, terminalState: z.enum(["accepted", "closed"]), completedWorkItem: z.object({ workItemId: id, revision: z.number().int().positive(), state: z.enum(["accepted", "closed"]) }).strict(), currentCandidate: z.record(z.string(), z.unknown()).nullable(), outcomeContext: z.record(z.string(), z.unknown()) }).passthrough();
 var actionPacketSchema = z.discriminatedUnion("kind", [attemptPacket, recoveryPacket, reviewPacket, nextPacket]);
+var workerPreflightPacketSchema = z.object({
+  kind: z.literal("preflight_attempt"),
+  schema: z.literal("loopctl-action-packet-v1"),
+  actionId: id,
+  actionKey: id,
+  action: z.object({ id, key: id, kind: z.literal("preflight_attempt"), state: z.literal("ready"), workItemRevision: z.number().int().positive(), targetPrincipal: id, targetTopicId: id, targetDigest: hash }).strict(),
+  workItemId: id,
+  workItemRevision: z.number().int().positive(),
+  targetPrincipal: id,
+  targetTopicId: id,
+  targetDigest: hash,
+  packetDigest: hash,
+  contracts: z.object({ taskContractHash: hash, referenceSnapshotHash: hash, writeScopeHash: hash, acceptanceContractHash: hash }).strict(),
+  ownerUid: id,
+  loopId: id,
+  profileId: id,
+  catscoProjectId: id,
+  workerTopicId: id,
+  evidenceTopicId: id,
+  workerSessionId: id,
+  githubRepo: id,
+  writeScope: z.array(id),
+  attemptId: id,
+  attemptNumber: z.number().int().positive(),
+  generation: z.number().int().nonnegative(),
+  runtimePrincipal: id,
+  leaseExpiresAt: z.string().datetime(),
+  proofMode: z.literal("catsco-message"),
+  proofKeyId: id.optional(),
+  proofPublicKey: id.optional(),
+  controllerSignatureAlgorithm: z.literal("ed25519"),
+  controllerKeyId: id,
+  controllerPublicKey: z.string().min(1),
+  controllerSignature: z.string().min(1),
+  workBundle: z.object({ contractDigest: hash, instructions: id, deliverables: z.array(id) }).strict()
+}).strict();
 
 // src/lib/events.ts
 import { z as z2 } from "zod";
@@ -157,13 +193,14 @@ function asIdentityRecord(value) {
   if (!row2 || typeof row2 !== "object" || Array.isArray(row2)) throw new CommandExecutionError2("CatsCo identity returned an invalid response");
   return row2;
 }
-async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal) {
+async function sendAttemptEvent(topicId, content, clientMsgId, expectedPrincipal, beforeSend) {
   if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError2("attested event targetTopicId must be a CatsCo Attempt topic");
   if (!clientMsgId.trim()) throw new CommandExecutionError2("attested event idempotencyKey is required");
   const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1];
   if (!expectedUid) throw new CommandExecutionError2("attested event source must be a numeric CatsCo principal");
-  const authenticatedUid = await currentCatscoUid();
+  const authenticatedUid = await authenticatedCatscoUid();
   if (authenticatedUid !== expectedUid) throw new CommandExecutionError2("CatsCo authenticated sender does not match attested event source");
+  beforeSend?.();
   const sent = asRecord(await runOpenCli(["catsco", "send", topicId, content, "--client-message-id", clientMsgId, "--format", "json"]), "attested event send");
   const receipt = {
     messageId: String(sent.messageId ?? ""),
@@ -218,7 +255,7 @@ async function runOpenCli(args) {
     });
   });
 }
-async function currentCatscoUid() {
+async function authenticatedCatscoUid() {
   const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
   const uid = String(row2.uid ?? "");
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
@@ -240,13 +277,22 @@ var packetSchema = z4.object({
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
+// src/lib/controller-provenance.ts
+import { ArgumentError } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
+var trustedControllerKeysSchema = z5.object({
+  version: z5.literal(1),
+  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+}).strict();
+
 // src/lib/commands.ts
 async function submitAttestedEvent(file, schema, label) {
   let submission;
   try {
     submission = schema.parse(JSON.parse(await readConfinedFile(file)));
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : `invalid ${label} submission file`);
+    throw new ArgumentError2(error instanceof Error ? error.message : `invalid ${label} submission file`);
   }
   const content = canonicalJson(submission.event);
   const event = JSON.parse(content);

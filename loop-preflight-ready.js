@@ -1,7 +1,8 @@
-// loop-review-submit.ts
+// loop-preflight-ready.ts
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
+import { createHash as createHash2 } from "node:crypto";
 import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
@@ -261,6 +262,44 @@ async function authenticatedCatscoUid() {
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
   return uid;
 }
+function csv(value) {
+  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+async function groupInfo(groupId) {
+  const row2 = asRecord(await runOpenCli(["catsco", "group-info", groupId, "--format", "json"]), "group topology");
+  const returnedGroupId = String(row2.groupId ?? "");
+  const topic = String(row2.topic ?? "");
+  const kind = String(row2.kind ?? "");
+  const agentIds = csv(row2.agentIds).sort();
+  const memberIds = csv(row2.memberIds).sort();
+  if (returnedGroupId !== groupId || topic !== `grp_${groupId}` || kind !== "standard" && kind !== "agent_task") {
+    throw new CommandExecutionError2("CatsCo group topology response did not bind the requested group");
+  }
+  return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
+}
+async function projectHasTopics(projectId, topics) {
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
+  const sessions = unwrap(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
+  if (!Array.isArray(sessions) || topics.some((topic) => !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic))) {
+    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain every Attempt topic");
+  }
+}
+async function verifyPreflightRoute(projectId, workerTopic, evidenceTopic, workerUid) {
+  if (!/^[1-9]\d*$/.test(workerUid) || !/^grp_[1-9]\d*$/.test(workerTopic) || !/^grp_[1-9]\d*$/.test(evidenceTopic) || workerTopic === evidenceTopic) {
+    throw new CommandExecutionError2("preflight route requires distinct numeric CatsCo group topics and Worker UID");
+  }
+  await projectHasTopics(projectId, [workerTopic, evidenceTopic]);
+  const workerGroup = await groupInfo(workerTopic.slice("grp_".length));
+  const evidenceGroup = await groupInfo(evidenceTopic.slice("grp_".length));
+  const workerAgentIds = workerGroup.agentIds.split(",").filter(Boolean);
+  const evidenceAgentIds = evidenceGroup.agentIds.split(",").filter(Boolean);
+  if (workerGroup.kind !== "agent_task" || workerAgentIds.length !== 1 || workerAgentIds[0] !== workerUid) {
+    throw new CommandExecutionError2("CatsCo execution group topology does not bind the authenticated Worker");
+  }
+  if (evidenceGroup.kind !== "standard" || !evidenceAgentIds.includes(workerUid)) {
+    throw new CommandExecutionError2("CatsCo evidence group topology does not include the authenticated Worker");
+  }
+}
 
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
@@ -278,41 +317,178 @@ var packetSchema = z4.object({
 var MAX_OUTPUT3 = 128 * 1024;
 
 // src/lib/controller-provenance.ts
+import { createHash, createPublicKey, verify } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ArgumentError } from "@jackwener/opencli/errors";
 import { z as z5 } from "zod";
+var SIGNING_ALGORITHM = "ed25519";
 var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
 var trustedControllerKeysSchema = z5.object({
   version: z5.literal(1),
   keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
 }).strict();
+function controllerCanonicalJson(value) {
+  return JSON.stringify(normalize(value));
+}
+function normalize(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("canonical JSON rejects non-finite numbers");
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (Array.isArray(value)) return value.map(normalize);
+  if (typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) {
+      const item = value[key];
+      if (item !== void 0) result[key] = normalize(item);
+    }
+    return result;
+  }
+  throw new TypeError(`canonical JSON rejects ${typeof value}`);
+}
+function controllerKeyId(publicKey) {
+  return `controller-ed25519:${createHash("sha256").update(publicKey).digest("base64url")}`;
+}
+function defaultTrustedKeysPath() {
+  return join(homedir(), ".config", "loopctl", "trusted-controller-keys.json");
+}
+function trustedKeysPath() {
+  const configured = process.env.LOOPCTL_TRUSTED_CONTROLLER_KEYS_FILE?.trim();
+  return configured || defaultTrustedKeysPath();
+}
+function readTrustedKeysFile(path) {
+  let descriptor;
+  try {
+    const pathStats = lstatSync(path);
+    if (pathStats.isSymbolicLink()) throw new Error("trusted Controller key file must not be a symbolic link");
+    if (!pathStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((pathStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const descriptorStats = fstatSync(descriptor);
+    if (!descriptorStats.isFile()) throw new Error("trusted Controller key file must be a regular file");
+    if ((descriptorStats.mode & 511) !== 384) throw new Error("trusted Controller key file must have mode 0600");
+    if (descriptorStats.size > MAX_TRUSTED_KEYS_BYTES) throw new Error("trusted Controller key file is too large");
+    if (typeof process.getuid === "function" && descriptorStats.uid !== process.getuid()) throw new Error("trusted Controller key file must be owned by the current user");
+    if (descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino) throw new Error("trusted Controller key file changed while opening");
+    return readFileSync(descriptor, "utf8");
+  } finally {
+    if (descriptor !== void 0) closeSync(descriptor);
+  }
+}
+function trustedKey(packet) {
+  let config;
+  try {
+    config = trustedControllerKeysSchema.parse(JSON.parse(readTrustedKeysFile(trustedKeysPath())));
+    const identities = /* @__PURE__ */ new Set();
+    for (const key of config.keys) {
+      const identity = `${key.ownerUid}\0${key.controllerKeyId}`;
+      if (identities.has(identity)) throw new Error("trusted Controller key configuration has duplicate owner/key entries");
+      identities.add(identity);
+      if (key.controllerKeyId !== controllerKeyId(key.publicKey)) throw new Error("trusted Controller key configuration has an invalid key ID");
+      if (createPublicKey(key.publicKey).asymmetricKeyType !== SIGNING_ALGORITHM) throw new Error("trusted Controller key configuration has a non-Ed25519 public key");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "invalid configuration";
+    throw new ArgumentError(`trusted Controller key configuration is unavailable or invalid: ${detail}`);
+  }
+  const matches = config.keys.filter((key) => key.ownerUid === packet.ownerUid && key.controllerKeyId === packet.controllerKeyId);
+  if (matches.length !== 1) throw new ArgumentError("preflight packet Controller key is not pinned for its owner");
+  const pin = matches[0];
+  if (pin.publicKey !== packet.controllerPublicKey) throw new ArgumentError("preflight packet Controller public key does not match its trusted pin");
+  return pin;
+}
+function verifyTrustedControllerPreflightPacket(packet) {
+  if (packet.controllerSignatureAlgorithm !== SIGNING_ALGORITHM) throw new ArgumentError("preflight packet Controller signature algorithm is invalid");
+  if (packet.controllerKeyId !== controllerKeyId(packet.controllerPublicKey)) throw new ArgumentError("preflight packet Controller key ID does not match its public key");
+  trustedKey(packet);
+  const { controllerSignature: _signature, packetDigest, ...withoutDigest } = packet;
+  const expectedDigest = createHash("sha256").update(controllerCanonicalJson(withoutDigest)).digest("hex");
+  if (packetDigest !== expectedDigest) throw new ArgumentError("preflight packet packetDigest does not match the canonical Controller action packet");
+  const { controllerSignature: _ignoredSignature, ...signaturePayload } = packet;
+  try {
+    const verified = verify(null, Buffer.from(controllerCanonicalJson(signaturePayload)), createPublicKey(packet.controllerPublicKey), Buffer.from(packet.controllerSignature, "base64"));
+    if (!verified) throw new Error("signature mismatch");
+  } catch {
+    throw new ArgumentError("preflight packet Controller signature is invalid");
+  }
+}
 
 // src/lib/commands.ts
-async function submitAttestedEvent(file, schema, label) {
-  let submission;
-  try {
-    submission = schema.parse(JSON.parse(await readConfinedFile(file)));
-  } catch (error) {
-    throw new ArgumentError2(error instanceof Error ? error.message : `invalid ${label} submission file`);
-  }
-  const content = canonicalJson(submission.event);
-  const event = JSON.parse(content);
-  const receipt = await sendAttemptEvent(submission.targetTopicId, content, submission.event.idempotencyKey, event.source);
-  return { targetTopicId: submission.targetTopicId, event: JSON.parse(content), receipt };
+var numericGroupTopic = /^grp_[1-9]\d*$/;
+var stableId = (prefix, parts) => `${prefix}:${createHash2("sha256").update(parts.join("\0")).digest("hex")}`;
+function assertFutureLease(packet) {
+  if (Date.parse(packet.leaseExpiresAt) <= Date.now()) throw new ArgumentError2("preflight packet leaseExpiresAt must be in the future");
 }
-async function reviewSubmit(kwargs) {
-  return submitAttestedEvent(String(kwargs["event-file"]), reviewSubmission, "Review");
+function validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid) {
+  assertFutureLease(packet);
+  const principal = `catsco-user:${authenticatedUid}`;
+  if (!numericGroupTopic.test(receivedTopic)) throw new ArgumentError2("received-topic must be a numeric CatsCo group topic");
+  if (!/^[1-9]\d*$/.test(packet.catscoProjectId)) throw new ArgumentError2("preflight packet catscoProjectId must be numeric");
+  if (packet.actionId !== packet.action.id || packet.actionKey !== packet.action.key || packet.kind !== packet.action.kind || packet.workItemRevision !== packet.action.workItemRevision || packet.targetPrincipal !== packet.action.targetPrincipal || packet.targetTopicId !== packet.action.targetTopicId || packet.targetDigest !== packet.action.targetDigest) {
+    throw new ArgumentError2("preflight packet action duplicates do not agree");
+  }
+  if (packet.targetPrincipal !== principal || packet.runtimePrincipal !== principal) {
+    throw new ArgumentError2("preflight packet target/runtime principal does not match authenticated CatsCo Bot");
+  }
+  if (packet.targetTopicId !== receivedTopic || packet.workerTopicId !== receivedTopic) {
+    throw new ArgumentError2("preflight packet execution topic does not match received-topic");
+  }
+  if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId === receivedTopic) {
+    throw new ArgumentError2("preflight packet evidenceTopicId must be a distinct numeric CatsCo group topic");
+  }
+  const sessionId = `session:v2:catscompany:group:${receivedTopic}:agent:${authenticatedUid}`;
+  if (packet.workerSessionId !== sessionId) throw new ArgumentError2("preflight packet workerSessionId is not the canonical Worker session");
+}
+async function preflightReady(kwargs) {
+  let packet;
+  try {
+    packet = workerPreflightPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs["packet-file"]))));
+  } catch (error) {
+    throw new ArgumentError2(error instanceof Error ? error.message : "invalid preflight packet file");
+  }
+  verifyTrustedControllerPreflightPacket(packet);
+  const receivedTopic = String(kwargs["received-topic"] ?? "");
+  const authenticatedUid = await authenticatedCatscoUid();
+  validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid);
+  await verifyPreflightRoute(packet.catscoProjectId, packet.workerTopicId, packet.evidenceTopicId, authenticatedUid);
+  const parts = [packet.actionKey, "worker_ready", packet.attemptId, String(packet.generation), String(packet.workItemRevision), packet.workerSessionId];
+  const event = workerReady.parse({
+    type: "worker_ready",
+    eventId: stableId("loop-event", parts),
+    idempotencyKey: stableId("loop-evidence", parts),
+    source: packet.runtimePrincipal,
+    entityRef: `attempt:${packet.attemptId}`,
+    payload: {
+      workItemId: packet.workItemId,
+      expectedRevision: packet.workItemRevision,
+      attemptId: packet.attemptId,
+      generation: packet.generation,
+      runtimePrincipal: packet.runtimePrincipal,
+      workerSessionId: packet.workerSessionId,
+      signature: "catsco-message-attested"
+    }
+  });
+  const content = canonicalJson(event);
+  const receipt = await sendAttemptEvent(packet.evidenceTopicId, content, event.idempotencyKey, event.source, () => assertFutureLease(packet));
+  return { targetTopicId: packet.evidenceTopicId, event: JSON.parse(content), receipt };
 }
 
-// loop-review-submit.ts
+// loop-preflight-ready.ts
 cli({
   site: "loop",
-  name: "review-submit",
-  description: "Review-only: submit a receipt-attested review_decided event to an Attempt evidence lane",
+  name: "preflight-ready",
+  description: "Worker-only: validate a native preflight packet and receipt-submit worker_ready",
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,
-  args: [{ name: "event-file", help: "Relative Review decision submission JSON file", required: true }],
+  args: [
+    { name: "packet-file", help: "Relative raw Controller preflight packet JSON file", required: true },
+    { name: "received-topic", help: "Native received CatsCo grp_<id> topic", required: true }
+  ],
   columns: ["targetTopicId", "event", "receipt"],
   defaultFormat: "json",
-  func: reviewSubmit
+  func: preflightReady
 });

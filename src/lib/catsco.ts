@@ -46,13 +46,14 @@ function asIdentityRecord(value: unknown): Record<string, unknown> {
   return row as Record<string, unknown>
 }
 
-export async function sendAttemptEvent(topicId: string, content: string, clientMsgId: string, expectedPrincipal: string): Promise<CatscoSendReceipt> {
+export async function sendAttemptEvent(topicId: string, content: string, clientMsgId: string, expectedPrincipal: string, beforeSend?: () => void): Promise<CatscoSendReceipt> {
   if (!/^(?:p2p_[1-9]\d*_[1-9]\d*|grp_[1-9]\d*)$/.test(topicId)) throw new CommandExecutionError('attested event targetTopicId must be a CatsCo Attempt topic')
   if (!clientMsgId.trim()) throw new CommandExecutionError('attested event idempotencyKey is required')
   const expectedUid = /^catsco-user:([1-9]\d*)$/.exec(expectedPrincipal)?.[1]
   if (!expectedUid) throw new CommandExecutionError('attested event source must be a numeric CatsCo principal')
-  const authenticatedUid = await currentCatscoUid()
+  const authenticatedUid = await authenticatedCatscoUid()
   if (authenticatedUid !== expectedUid) throw new CommandExecutionError('CatsCo authenticated sender does not match attested event source')
+  beforeSend?.()
   const sent = asRecord(await runOpenCli(['catsco', 'send', topicId, content, '--client-message-id', clientMsgId, '--format', 'json']), 'attested event send')
   const receipt = {
     messageId: String(sent.messageId ?? ''),
@@ -91,7 +92,7 @@ async function runOpenCli(args: string[]): Promise<unknown> {
   })
 }
 
-async function currentCatscoUid(): Promise<string> {
+export async function authenticatedCatscoUid(): Promise<string> {
   const row = asIdentityRecord(await runOpenCli(['catsco', 'me', '--format', 'json']))
   const uid = String(row.uid ?? '')
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError('CatsCo identity response has no numeric uid')
@@ -102,7 +103,7 @@ function csv(value: unknown): string[] {
   return String(value ?? '').split(',').map(item => item.trim()).filter(Boolean)
 }
 
-async function groupInfo(groupId: string): Promise<StandardTopic> {
+export async function groupInfo(groupId: string): Promise<StandardTopic> {
   const row = asRecord(await runOpenCli(['catsco', 'group-info', groupId, '--format', 'json']), 'group topology')
   const returnedGroupId = String(row.groupId ?? '')
   const topic = String(row.topic ?? '')
@@ -116,7 +117,7 @@ async function groupInfo(groupId: string): Promise<StandardTopic> {
 }
 
 export async function createStandardTopic(name: string, memberUids: string[]): Promise<StandardTopic> {
-  const ownerUid = await currentCatscoUid()
+  const ownerUid = await authenticatedCatscoUid()
   const requestedMemberUids = [...new Set(memberUids)].sort()
   // CatsCo returns human participants only in memberIds. The authenticated owner
   // is therefore a member but not an agentIds entry when it is also a requested
@@ -140,7 +141,7 @@ export async function createStandardTopic(name: string, memberUids: string[]): P
 }
 
 export async function createAgentTaskTopic(name: string, workerAgentUid: string): Promise<AgentTaskTopic> {
-  const ownerUid = await currentCatscoUid()
+  const ownerUid = await authenticatedCatscoUid()
   if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError('agent-task Worker UID must be numeric')
   if (!name || name.length > 180) throw new CommandExecutionError('agent-task name is invalid')
   const value = await runOpenCli(['catsco', 'group-create', name, workerAgentUid, '--kind', 'agent_task', '--format', 'json'])
@@ -188,11 +189,34 @@ export async function resolveLoopProject(loopId: string, requestedProjectId: str
   return String((created as Record<string, unknown>).id)
 }
 
+async function projectHasTopics(projectId: string, topics: string[]): Promise<void> {
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError('CatsCo Project id must be numeric')
+  const sessions = unwrap(await runOpenCli(['catsco', 'project-sessions', projectId, '--format', 'json']))
+  if (!Array.isArray(sessions) || topics.some(topic => !sessions.some(row => row && typeof row === 'object' && String((row as Record<string, unknown>).topicId ?? '') === topic))) {
+    throw new CommandExecutionError('CatsCo Project assignment readback did not contain every Attempt topic')
+  }
+}
+
+/** Verify an existing Project-first Worker/evidence route without modifying CatsCo state. */
+export async function verifyPreflightRoute(projectId: string, workerTopic: string, evidenceTopic: string, workerUid: string): Promise<void> {
+  if (!/^[1-9]\d*$/.test(workerUid) || !/^grp_[1-9]\d*$/.test(workerTopic) || !/^grp_[1-9]\d*$/.test(evidenceTopic) || workerTopic === evidenceTopic) {
+    throw new CommandExecutionError('preflight route requires distinct numeric CatsCo group topics and Worker UID')
+  }
+  await projectHasTopics(projectId, [workerTopic, evidenceTopic])
+  const workerGroup = await groupInfo(workerTopic.slice('grp_'.length))
+  const evidenceGroup = await groupInfo(evidenceTopic.slice('grp_'.length))
+  const workerAgentIds = workerGroup.agentIds.split(',').filter(Boolean)
+  const evidenceAgentIds = evidenceGroup.agentIds.split(',').filter(Boolean)
+  if (workerGroup.kind !== 'agent_task' || workerAgentIds.length !== 1 || workerAgentIds[0] !== workerUid) {
+    throw new CommandExecutionError('CatsCo execution group topology does not bind the authenticated Worker')
+  }
+  if (evidenceGroup.kind !== 'standard' || !evidenceAgentIds.includes(workerUid)) {
+    throw new CommandExecutionError('CatsCo evidence group topology does not include the authenticated Worker')
+  }
+}
+
 export async function attachTopicToProject(projectId: string, topic: string): Promise<void> {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError('CatsCo Project id must be numeric')
   await runOpenCli(['catsco', 'project-assign-topic', projectId, topic, '--format', 'json'])
-  const sessions = unwrap(await runOpenCli(['catsco', 'project-sessions', projectId, '--format', 'json']))
-  if (!Array.isArray(sessions) || !sessions.some(row => row && typeof row === 'object' && String((row as Record<string, unknown>).topicId ?? '') === topic)) {
-    throw new CommandExecutionError('CatsCo Project assignment readback did not contain the Attempt topic')
-  }
+  await projectHasTopics(projectId, [topic])
 }

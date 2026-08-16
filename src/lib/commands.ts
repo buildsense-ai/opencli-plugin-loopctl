@@ -1,10 +1,12 @@
+import { createHash } from 'node:crypto'
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
-import { actionPacketSchema, receiptSchema, statusSchema, tickSchema } from './schemas.js'
+import { actionPacketSchema, receiptSchema, statusSchema, tickSchema, workerPreflightPacketSchema, type WorkerPreflightPacket } from './schemas.js'
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
-import { attachTopicToProject, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
+import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent, verifyPreflightRoute } from './catsco.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
+import { verifyTrustedControllerPreflightPacket } from './controller-provenance.js'
 
 const asObject=(value:unknown):Record<string,unknown>=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new CommandExecutionError('loopctl returned a non-object JSON value');return value as Record<string,unknown>}
 const parseResponse=<T>(schema:{parse(value:unknown):T},value:unknown,label:string):T=>{try{return schema.parse(value)}catch{throw new CommandExecutionError(`loopctl returned malformed ${label} JSON`)}}
@@ -234,6 +236,62 @@ export async function workspacePrepare(kwargs:any){
   try { packet=JSON.parse(await readConfinedFile(String(kwargs['packet-file']))) }
   catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid execute packet file') }
   return prepareWorkspaceFromPacket(packet)
+}
+
+const numericCatscoPrincipal=/^catsco-user:([1-9]\d*)$/
+const numericGroupTopic=/^grp_[1-9]\d*$/
+const stableId=(prefix:string,parts:string[])=>`${prefix}:${createHash('sha256').update(parts.join('\u0000')).digest('hex')}`
+function assertFutureLease(packet: WorkerPreflightPacket) {
+  if (Date.parse(packet.leaseExpiresAt)<=Date.now()) throw new ArgumentError('preflight packet leaseExpiresAt must be in the future')
+}
+
+function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTopic: string, authenticatedUid: string) {
+  assertFutureLease(packet)
+  const principal=`catsco-user:${authenticatedUid}`
+  if (!numericGroupTopic.test(receivedTopic)) throw new ArgumentError('received-topic must be a numeric CatsCo group topic')
+  if (!/^[1-9]\d*$/.test(packet.catscoProjectId)) throw new ArgumentError('preflight packet catscoProjectId must be numeric')
+  if (packet.actionId!==packet.action.id || packet.actionKey!==packet.action.key || packet.kind!==packet.action.kind ||
+    packet.workItemRevision!==packet.action.workItemRevision || packet.targetPrincipal!==packet.action.targetPrincipal ||
+    packet.targetTopicId!==packet.action.targetTopicId || packet.targetDigest!==packet.action.targetDigest) {
+    throw new ArgumentError('preflight packet action duplicates do not agree')
+  }
+  if (packet.targetPrincipal!==principal || packet.runtimePrincipal!==principal) {
+    throw new ArgumentError('preflight packet target/runtime principal does not match authenticated CatsCo Bot')
+  }
+  if (packet.targetTopicId!==receivedTopic || packet.workerTopicId!==receivedTopic) {
+    throw new ArgumentError('preflight packet execution topic does not match received-topic')
+  }
+  if (!numericGroupTopic.test(packet.evidenceTopicId) || packet.evidenceTopicId===receivedTopic) {
+    throw new ArgumentError('preflight packet evidenceTopicId must be a distinct numeric CatsCo group topic')
+  }
+  const sessionId=`session:v2:catscompany:group:${receivedTopic}:agent:${authenticatedUid}`
+  if (packet.workerSessionId!==sessionId) throw new ArgumentError('preflight packet workerSessionId is not the canonical Worker session')
+}
+
+/** Mechanically emit only the receipt-attested worker_ready event for a native preflight packet. */
+export async function preflightReady(kwargs:any) {
+  let packet: WorkerPreflightPacket
+  try { packet=workerPreflightPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs['packet-file'])))) }
+  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid preflight packet file') }
+  // Verify Controller provenance and the locally pinned key before invoking
+  // CatsCo or taking any action based on the self-carried packet fields.
+  verifyTrustedControllerPreflightPacket(packet)
+  const receivedTopic=String(kwargs['received-topic']??'')
+  const authenticatedUid=await authenticatedCatscoUid()
+  validateWorkerPreflightPacket(packet, receivedTopic, authenticatedUid)
+  await verifyPreflightRoute(packet.catscoProjectId, packet.workerTopicId, packet.evidenceTopicId, authenticatedUid)
+  const parts=[packet.actionKey,'worker_ready',packet.attemptId,String(packet.generation),String(packet.workItemRevision),packet.workerSessionId]
+  const event=workerReady.parse({
+    type:'worker_ready', eventId:stableId('loop-event',parts), idempotencyKey:stableId('loop-evidence',parts),
+    source:packet.runtimePrincipal, entityRef:`attempt:${packet.attemptId}`,
+    payload:{workItemId:packet.workItemId,expectedRevision:packet.workItemRevision,attemptId:packet.attemptId,generation:packet.generation,
+      runtimePrincipal:packet.runtimePrincipal,workerSessionId:packet.workerSessionId,signature:'catsco-message-attested'}
+  })
+  const content=canonicalJson(event)
+  // Recheck at the transport boundary because route verification can take long
+  // enough for an otherwise valid lease to expire.
+  const receipt=await sendAttemptEvent(packet.evidenceTopicId,content,event.idempotencyKey,event.source,()=>assertFutureLease(packet))
+  return {targetTopicId:packet.evidenceTopicId,event:JSON.parse(content),receipt}
 }
 export async function bundleCommand(kwargs:any){const event=await readEvent(String(kwargs['event-file']),bundle);return {receipt:await ingest(event),tick:await tick()}}
 export async function builder(kwargs:any,schema:any){const event=await readEvent(String(kwargs['event-file']),schema);return JSON.parse(canonicalJson(event))}

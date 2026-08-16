@@ -44,4 +44,21 @@ const recoveryPacket = z.object({ ...packetBase, kind: z.literal('recover_attemp
 const reviewPacket = z.object({ ...packetBase, kind: z.literal('review_candidate'), loopId: id, profileId: id, githubRepo: id, stewardPrincipal: id, stewardTopicId: id, evidenceTopicId: id.optional(), acceptanceContractHash: hash, candidate: z.object({ candidateId: id, attemptId: id, generation: z.number().int().nonnegative(), deliverable: z.record(z.string(), z.unknown()), digest: hash, trustedEvidence: z.record(z.string(), z.unknown()) }).nullable() }).passthrough()
 const nextPacket = z.object({ ...packetBase, kind: z.literal('plan_next'), loopId: id, profileId: id, terminalState: z.enum(['accepted', 'closed']), completedWorkItem: z.object({ workItemId: id, revision: z.number().int().positive(), state: z.enum(['accepted', 'closed']) }).strict(), currentCandidate: z.record(z.string(), z.unknown()).nullable(), outcomeContext: z.record(z.string(), z.unknown()) }).passthrough()
 export const actionPacketSchema = z.discriminatedUnion('kind', [attemptPacket, recoveryPacket, reviewPacket, nextPacket])
+
+/** Exact Controller projection accepted by the Worker-only preflight receipt helper. */
+export const workerPreflightPacketSchema = z.object({
+  kind: z.literal('preflight_attempt'), schema: z.literal('loopctl-action-packet-v1'),
+  actionId: id, actionKey: id,
+  action: z.object({ id, key: id, kind: z.literal('preflight_attempt'), state: z.literal('ready'), workItemRevision: z.number().int().positive(), targetPrincipal: id, targetTopicId: id, targetDigest: hash }).strict(),
+  workItemId: id, workItemRevision: z.number().int().positive(),
+  targetPrincipal: id, targetTopicId: id, targetDigest: hash, packetDigest: hash,
+  contracts: z.object({ taskContractHash: hash, referenceSnapshotHash: hash, writeScopeHash: hash, acceptanceContractHash: hash }).strict(),
+  ownerUid: id, loopId: id, profileId: id, catscoProjectId: id, workerTopicId: id, evidenceTopicId: id, workerSessionId: id,
+  githubRepo: id, writeScope: z.array(id), attemptId: id, attemptNumber: z.number().int().positive(), generation: z.number().int().nonnegative(),
+  runtimePrincipal: id, leaseExpiresAt: z.string().datetime(), proofMode: z.literal('catsco-message'),
+  proofKeyId: id.optional(), proofPublicKey: id.optional(),
+  controllerSignatureAlgorithm: z.literal('ed25519'), controllerKeyId: id, controllerPublicKey: z.string().min(1), controllerSignature: z.string().min(1),
+  workBundle: z.object({ contractDigest: hash, instructions: id, deliverables: z.array(id) }).strict()
+}).strict()
 export type ActionPacket = z.infer<typeof actionPacketSchema>
+export type WorkerPreflightPacket = z.infer<typeof workerPreflightPacketSchema>

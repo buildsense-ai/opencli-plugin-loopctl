@@ -2,7 +2,7 @@
 import { cli, Strategy } from "@jackwener/opencli/registry";
 
 // src/lib/commands.ts
-import { ArgumentError, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
+import { ArgumentError as ArgumentError2, CommandExecutionError as CommandExecutionError4 } from "@jackwener/opencli/errors";
 
 // src/lib/schemas.ts
 import { z } from "zod";
@@ -60,6 +60,42 @@ var recoveryPacket = z.object({ ...packetBase, kind: z.literal("recover_attempt"
 var reviewPacket = z.object({ ...packetBase, kind: z.literal("review_candidate"), loopId: id, profileId: id, githubRepo: id, stewardPrincipal: id, stewardTopicId: id, evidenceTopicId: id.optional(), acceptanceContractHash: hash, candidate: z.object({ candidateId: id, attemptId: id, generation: z.number().int().nonnegative(), deliverable: z.record(z.string(), z.unknown()), digest: hash, trustedEvidence: z.record(z.string(), z.unknown()) }).nullable() }).passthrough();
 var nextPacket = z.object({ ...packetBase, kind: z.literal("plan_next"), loopId: id, profileId: id, terminalState: z.enum(["accepted", "closed"]), completedWorkItem: z.object({ workItemId: id, revision: z.number().int().positive(), state: z.enum(["accepted", "closed"]) }).strict(), currentCandidate: z.record(z.string(), z.unknown()).nullable(), outcomeContext: z.record(z.string(), z.unknown()) }).passthrough();
 var actionPacketSchema = z.discriminatedUnion("kind", [attemptPacket, recoveryPacket, reviewPacket, nextPacket]);
+var workerPreflightPacketSchema = z.object({
+  kind: z.literal("preflight_attempt"),
+  schema: z.literal("loopctl-action-packet-v1"),
+  actionId: id,
+  actionKey: id,
+  action: z.object({ id, key: id, kind: z.literal("preflight_attempt"), state: z.literal("ready"), workItemRevision: z.number().int().positive(), targetPrincipal: id, targetTopicId: id, targetDigest: hash }).strict(),
+  workItemId: id,
+  workItemRevision: z.number().int().positive(),
+  targetPrincipal: id,
+  targetTopicId: id,
+  targetDigest: hash,
+  packetDigest: hash,
+  contracts: z.object({ taskContractHash: hash, referenceSnapshotHash: hash, writeScopeHash: hash, acceptanceContractHash: hash }).strict(),
+  ownerUid: id,
+  loopId: id,
+  profileId: id,
+  catscoProjectId: id,
+  workerTopicId: id,
+  evidenceTopicId: id,
+  workerSessionId: id,
+  githubRepo: id,
+  writeScope: z.array(id),
+  attemptId: id,
+  attemptNumber: z.number().int().positive(),
+  generation: z.number().int().nonnegative(),
+  runtimePrincipal: id,
+  leaseExpiresAt: z.string().datetime(),
+  proofMode: z.literal("catsco-message"),
+  proofKeyId: id.optional(),
+  proofPublicKey: id.optional(),
+  controllerSignatureAlgorithm: z.literal("ed25519"),
+  controllerKeyId: id,
+  controllerPublicKey: z.string().min(1),
+  controllerSignature: z.string().min(1),
+  workBundle: z.object({ contractDigest: hash, instructions: id, deliverables: z.array(id) }).strict()
+}).strict();
 
 // src/lib/events.ts
 import { posix } from "node:path";
@@ -308,7 +344,7 @@ async function runOpenCli(args) {
     });
   });
 }
-async function currentCatscoUid() {
+async function authenticatedCatscoUid() {
   const row2 = asIdentityRecord(await runOpenCli(["catsco", "me", "--format", "json"]));
   const uid = String(row2.uid ?? "");
   if (!/^[1-9]\d*$/.test(uid)) throw new CommandExecutionError2("CatsCo identity response has no numeric uid");
@@ -330,7 +366,7 @@ async function groupInfo(groupId) {
   return { groupId: returnedGroupId, topic, kind, agentIds: agentIds.join(","), memberIds: memberIds.join(",") };
 }
 async function createStandardTopic(name, memberUids) {
-  const ownerUid = await currentCatscoUid();
+  const ownerUid = await authenticatedCatscoUid();
   const requestedMemberUids = [...new Set(memberUids)].sort();
   const expectedMemberIds = [.../* @__PURE__ */ new Set([ownerUid, ...requestedMemberUids])].sort();
   const expectedAgentIds = requestedMemberUids.filter((uid) => uid !== ownerUid);
@@ -349,7 +385,7 @@ async function createStandardTopic(name, memberUids) {
   return { ...topology, kind: "standard" };
 }
 async function createAgentTaskTopic(name, workerAgentUid) {
-  const ownerUid = await currentCatscoUid();
+  const ownerUid = await authenticatedCatscoUid();
   if (!/^[1-9]\d*$/.test(workerAgentUid)) throw new CommandExecutionError2("agent-task Worker UID must be numeric");
   if (!name || name.length > 180) throw new CommandExecutionError2("agent-task name is invalid");
   const value = await runOpenCli(["catsco", "group-create", name, workerAgentUid, "--kind", "agent_task", "--format", "json"]);
@@ -378,13 +414,17 @@ async function createAttemptProject(loopId, attemptId) {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project provisioning returned an invalid Project id");
   return projectId;
 }
+async function projectHasTopics(projectId, topics) {
+  if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
+  const sessions = unwrap2(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
+  if (!Array.isArray(sessions) || topics.some((topic) => !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic))) {
+    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain every Attempt topic");
+  }
+}
 async function attachTopicToProject(projectId, topic) {
   if (!/^[1-9]\d*$/.test(projectId)) throw new CommandExecutionError2("CatsCo Project id must be numeric");
   await runOpenCli(["catsco", "project-assign-topic", projectId, topic, "--format", "json"]);
-  const sessions = unwrap2(await runOpenCli(["catsco", "project-sessions", projectId, "--format", "json"]));
-  if (!Array.isArray(sessions) || !sessions.some((row2) => row2 && typeof row2 === "object" && String(row2.topicId ?? "") === topic)) {
-    throw new CommandExecutionError2("CatsCo Project assignment readback did not contain the Attempt topic");
-  }
+  await projectHasTopics(projectId, [topic]);
 }
 
 // src/lib/provisioning-journal.ts
@@ -594,6 +634,15 @@ var packetSchema = z4.object({
 }).passthrough();
 var MAX_OUTPUT3 = 128 * 1024;
 
+// src/lib/controller-provenance.ts
+import { ArgumentError } from "@jackwener/opencli/errors";
+import { z as z5 } from "zod";
+var MAX_TRUSTED_KEYS_BYTES = 64 * 1024;
+var trustedControllerKeysSchema = z5.object({
+  version: z5.literal(1),
+  keys: z5.array(z5.object({ ownerUid: z5.string().min(1), controllerKeyId: z5.string().min(1), publicKey: z5.string().min(1) }).strict())
+}).strict();
+
 // src/lib/commands.ts
 var parseResponse = (schema, value, label) => {
   try {
@@ -604,7 +653,7 @@ var parseResponse = (schema, value, label) => {
 };
 var assertAcceptedReceipt = (value) => {
   const receipt = parseResponse(receiptSchema, value, "receipt");
-  if (receipt.status === "rejected") throw new ArgumentError(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
+  if (receipt.status === "rejected") throw new ArgumentError2(`loopctl rejected event: ${receipt.rejectionCode ?? "unknown"}`);
   return receipt;
 };
 async function ingest(event) {
@@ -621,7 +670,7 @@ async function agentTaskStart(kwargs) {
     raw = await readConfinedFile(String(kwargs["plan-file"]));
     parsed = parseAgentTaskStart(raw);
   } catch (error) {
-    throw new ArgumentError(error instanceof Error ? error.message : "invalid agent-task start plan");
+    throw new ArgumentError2(error instanceof Error ? error.message : "invalid agent-task start plan");
   }
   const journalStore = await openProvisionJournal("agent-task-start", JSON.parse(raw));
   const asRecord2 = (topic) => ({

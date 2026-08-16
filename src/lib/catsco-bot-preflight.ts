@@ -43,12 +43,14 @@ export async function readNativeActionPacket(receivedTopic:string, expectedKind:
   const candidates:unknown[]=[]
   for(const rawRow of response.messages){
     const row=record(rawRow,'native Action message')
-    if(String(row.topic_id??'')!==receivedTopic)throw new CommandExecutionError('native Action message topic is invalid')
-    if(!/^\d+$/.test(String(row.id??''))||String(row.id)!==String(row.seq_id??''))throw new CommandExecutionError('native Action message id/seq is invalid')
-    if(String(row.type??'')!=='text'||String(row.msg_type??'text')!=='text')throw new CommandExecutionError('native Action message type is invalid')
+    // Worker-originated runtime/tool chatter is not Controller evidence and is deliberately
+    // ignored before any Controller-envelope validation. Its shape is not an authorization input.
     const sender=String(row.from_uid??row.from??'')
     if(sender===c.expectedBotUid)continue
     if(sender!==c.controllerUid)throw new CommandExecutionError('native Action message sender is invalid')
+    if(String(row.topic_id??'')!==receivedTopic)throw new CommandExecutionError('native Action message topic is invalid')
+    if(!/^\d+$/.test(String(row.id??''))||String(row.id)!==String(row.seq_id??''))throw new CommandExecutionError('native Action message id/seq is invalid')
+    if(String(row.type??'')!=='text'||String(row.msg_type??'text')!=='text')throw new CommandExecutionError('native Action message type is invalid')
     for(const actor of [row.actor_uid,row.actorUid,row.metadata&&typeof row.metadata==='object'?(row.metadata as Record<string,unknown>).actor_uid:undefined]) if(actor!==undefined&&String(actor)!==c.controllerUid)throw new CommandExecutionError('native Action message actor is invalid')
     let packet:unknown
     try{packet=typeof row.content==='string'?JSON.parse(row.content):JSON.parse(canonicalJson(row.content))}catch{throw new CommandExecutionError('native Action message content is not a JSON packet')}

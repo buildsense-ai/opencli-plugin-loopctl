@@ -145,34 +145,11 @@ function canonicalJson(value) {
 var integrationInputs = z2.object({ workItemId: id2, candidateId: id2, repository: id2, prNumber: z2.number().int().positive(), headSha: id2, digest: hash2 }).strict();
 
 // src/lib/loopctl.ts
-import { constants as fsConstants } from "node:fs";
-import { realpath, lstat, open } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
 import { z as z3 } from "zod";
 import { CommandExecutionError } from "@jackwener/opencli/errors";
 var MAX_OUTPUT = 2 * 1024 * 1024;
 var MAX_INPUT = 512 * 1024;
 var jsonValue = z3.unknown();
-async function readConfinedFile(file) {
-  if (!file || isAbsolute(file)) throw new Error("input file must be relative to the current directory");
-  const cwd = resolve(process.cwd());
-  const requested = resolve(cwd, file);
-  const info = await lstat(requested);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("input file must be a regular non-symlink file");
-  const actual = await realpath(requested);
-  const rel = relative(cwd, actual);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("input file must remain inside the current directory");
-  const handle = await open(requested, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("input file must remain a regular file");
-    const value = await handle.readFile("utf8");
-    if (Buffer.byteLength(value) > MAX_INPUT) throw new Error("input file is too large");
-    return value;
-  } finally {
-    await handle.close();
-  }
-}
 
 // src/lib/catsco.ts
 import { CommandExecutionError as CommandExecutionError2 } from "@jackwener/opencli/errors";
@@ -191,13 +168,7 @@ var MAX_RESPONSE_BYTES = 128 * 1024;
 var MAX_RECEIPT_HISTORY = 100;
 var REQUEST_TIMEOUT_MS = 15e3;
 var TRUSTED_HTTP_BASE_URL = "https://app.catsco.cc";
-var configSchema = z4.object({
-  version: z4.literal(1),
-  transport: z4.literal("catsco-bot-preflight-v1"),
-  httpBaseUrl: z4.string().min(1),
-  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
-  apiKeyFile: z4.string().min(1)
-}).strict();
+var configSchema = z4.object({ version: z4.literal(1), transport: z4.literal("catsco-bot-preflight-v1"), httpBaseUrl: z4.string().min(1), expectedBotUid: z4.string().regex(/^[1-9]\d*$/), controllerUid: z4.literal("602").default("602"), apiKeyFile: z4.string().min(1) }).strict();
 function configuredPath() {
   return process.env.LOOPCTL_BOT_PREFLIGHT_CONFIG?.trim() || join(homedir(), ".config", "loopctl", "catsco-bot-preflight.json");
 }
@@ -217,94 +188,102 @@ function secureRead(path, maxBytes, label) {
     if (fd !== void 0) closeSync(fd);
   }
 }
-function trustedHttpBaseUrl(value) {
-  const raw = value.trim();
-  if (raw !== TRUSTED_HTTP_BASE_URL && raw !== `${TRUSTED_HTTP_BASE_URL}/`) throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
-  const url = new URL(raw);
-  if (url.protocol !== "https:" || url.hostname !== "app.catsco.cc" || url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
-    throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
-  }
-  return TRUSTED_HTTP_BASE_URL;
-}
 function loadConfig() {
   try {
-    const config = configSchema.parse(JSON.parse(secureRead(configuredPath(), MAX_CONFIG_BYTES, "Bot preflight config")));
-    config.httpBaseUrl = trustedHttpBaseUrl(config.httpBaseUrl);
-    if (!config.apiKeyFile.startsWith("/")) throw new Error("apiKeyFile must be an absolute path");
-    return config;
-  } catch (error) {
-    throw new ArgumentError(`Bot preflight configuration is unavailable or invalid: ${error instanceof Error ? error.message : "invalid configuration"}`);
+    const c = configSchema.parse(JSON.parse(secureRead(configuredPath(), MAX_CONFIG_BYTES, "Bot preflight config")));
+    const u = new URL(c.httpBaseUrl);
+    if (c.httpBaseUrl !== TRUSTED_HTTP_BASE_URL || u.protocol !== "https:" || u.hostname !== "app.catsco.cc" || u.port || u.username || u.password || u.pathname !== "/" || u.search || u.hash) throw new Error(`httpBaseUrl must be exactly ${TRUSTED_HTTP_BASE_URL}`);
+    if (!c.apiKeyFile.startsWith("/")) throw new Error("apiKeyFile must be an absolute path");
+    return c;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight configuration is unavailable or invalid: ${e instanceof Error ? e.message : "invalid configuration"}`);
   }
 }
-function apiKey(config) {
+function apiKey(c) {
   try {
-    const value = secureRead(config.apiKeyFile, MAX_KEY_BYTES, "Bot preflight API key").trim();
-    if (!value || /[\r\n\0]/.test(value)) throw new Error("Bot preflight API key is invalid");
-    return value;
-  } catch (error) {
-    throw new ArgumentError(`Bot preflight API key is unavailable or invalid: ${error instanceof Error ? error.message : "invalid key"}`);
+    const v = secureRead(c.apiKeyFile, MAX_KEY_BYTES, "Bot preflight API key").trim();
+    if (!v || /[\r\n\0]/.test(v)) throw new Error("Bot preflight API key is invalid");
+    return v;
+  } catch (e) {
+    throw new ArgumentError(`Bot preflight API key is unavailable or invalid: ${e instanceof Error ? e.message : "invalid key"}`);
   }
 }
-async function boundedResponseText(response) {
-  if (!response.body) throw new CommandExecutionError3("CatsCo Bot API response body is unavailable");
-  const reader = response.body.getReader();
-  const chunks = [];
+async function boundedResponseText(r) {
+  if (!r.body) throw new CommandExecutionError3("CatsCo Bot API response body is unavailable");
+  const reader = r.body.getReader(), chunks = [];
   let bytes = 0;
   try {
     while (true) {
-      const next = await reader.read();
-      if (next.done) break;
-      const chunk = next.value;
-      bytes += chunk.byteLength;
+      const n = await reader.read();
+      if (n.done) break;
+      bytes += n.value.byteLength;
       if (bytes > MAX_RESPONSE_BYTES) {
         await reader.cancel().catch(() => void 0);
         throw new CommandExecutionError3("CatsCo Bot API response is too large");
       }
-      chunks.push(chunk);
+      chunks.push(n.value);
     }
   } finally {
     reader.releaseLock();
   }
-  const combined = new Uint8Array(bytes);
+  const all = new Uint8Array(bytes);
   let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
+  for (const c of chunks) {
+    all.set(c, offset);
+    offset += c.byteLength;
   }
-  return new TextDecoder().decode(combined);
+  return new TextDecoder().decode(all);
 }
 async function request(key, path, init) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const c = new AbortController(), timer = setTimeout(() => c.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(`${TRUSTED_HTTP_BASE_URL}${path}`, { ...init, redirect: "error", signal: controller.signal, headers: { Authorization: `ApiKey ${key}`, ...init.headers } });
-    const text = await boundedResponseText(response);
-    if (!response.ok) throw new CommandExecutionError3(`CatsCo Bot API request failed with HTTP ${response.status}`);
+    const r = await fetch(`${TRUSTED_HTTP_BASE_URL}${path}`, { ...init, redirect: "error", signal: c.signal, headers: { Authorization: `ApiKey ${key}`, ...init.headers } });
+    const text = await boundedResponseText(r);
+    if (!r.ok) throw new CommandExecutionError3(`CatsCo Bot API request failed with HTTP ${r.status}`);
     try {
       return JSON.parse(text);
     } catch {
       throw new CommandExecutionError3("CatsCo Bot API returned invalid JSON");
     }
-  } catch (error) {
-    if (error instanceof CommandExecutionError3) throw error;
-    throw new CommandExecutionError3(`CatsCo Bot API request failed: ${error instanceof Error ? error.name : "network error"}`);
+  } catch (e) {
+    if (e instanceof CommandExecutionError3) throw e;
+    throw new CommandExecutionError3(`CatsCo Bot API request failed: ${e instanceof Error ? e.name : "network error"}`);
   } finally {
     clearTimeout(timer);
   }
 }
-function record(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CommandExecutionError3(`CatsCo Bot API returned invalid ${label}`);
-  return value;
+function record(v, label) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new CommandExecutionError3(`CatsCo Bot API returned invalid ${label}`);
+  return v;
 }
 function contentDigest(content) {
   return createHash("sha256").update(content).digest("hex");
 }
-function historyRows(value) {
-  const envelope = record(value, "message receipt");
-  if (!Array.isArray(envelope.messages) || envelope.messages.length === 0 || envelope.messages.length > MAX_RECEIPT_HISTORY) {
-    throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
+async function authenticated(c, key) {
+  const me = record(await request(key, "/api/me", { method: "GET" }), "identity");
+  if (String(me.uid ?? "") !== c.expectedBotUid || String(me.account_type ?? "").toLowerCase() !== "bot") throw new CommandExecutionError3("CatsCo Bot API identity does not match configured Worker Bot");
+}
+function assertConfiguredControllerOwner(ownerUid) {
+  if (ownerUid !== loadConfig().controllerUid) throw new ArgumentError("preflight packet ownerUid does not match configured Controller UID");
+}
+async function readNativePreflightPacket(receivedTopic) {
+  if (!/^grp_[1-9]\d*$/.test(receivedTopic)) throw new ArgumentError("received-topic must be a numeric CatsCo group topic");
+  const c = loadConfig(), key = apiKey(c);
+  await authenticated(c, key);
+  const response = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(receivedTopic)}&latest=true&limit=1`, { method: "GET" }), "native Action message");
+  if (!Array.isArray(response.messages) || response.messages.length !== 1) throw new CommandExecutionError3("CatsCo Bot API did not return exactly one native Action message");
+  const row2 = record(response.messages[0], "native Action message");
+  if (String(row2.topic_id ?? "") !== receivedTopic) throw new CommandExecutionError3("native Action message topic is invalid");
+  if (String(row2.from_uid ?? row2.from ?? "") !== c.controllerUid) throw new CommandExecutionError3("native Action message Controller sender is invalid");
+  if (!/^\d+$/.test(String(row2.id ?? "")) || String(row2.id) !== String(row2.seq_id ?? "")) throw new CommandExecutionError3("native Action message id/seq is invalid");
+  if (String(row2.type ?? "") !== "text" || String(row2.msg_type ?? "text") !== "text") throw new CommandExecutionError3("native Action message type is invalid");
+  for (const actor of [row2.actor_uid, row2.actorUid, row2.metadata && typeof row2.metadata === "object" ? row2.metadata.actor_uid : void 0]) if (actor !== void 0 && String(actor) !== c.controllerUid) throw new CommandExecutionError3("native Action message actor is invalid");
+  const raw = row2.content;
+  try {
+    return typeof raw === "string" ? JSON.parse(raw) : JSON.parse(canonicalJson(raw));
+  } catch {
+    throw new CommandExecutionError3("native Action message content is not a JSON packet");
   }
-  return envelope.messages.map((row2) => record(row2, "message receipt"));
 }
 function isExactLatestReceipt(row2, receipt, expectedUid, content) {
   if (String(row2.id ?? "") !== receipt.messageId || String(row2.seq_id ?? "") !== receipt.seqId || String(row2.topic_id ?? "") !== receipt.topicId || String(row2.from_uid ?? row2.from ?? "") !== expectedUid || String(row2.type ?? "") !== "worker_ready") return false;
@@ -315,20 +294,18 @@ function isExactLatestReceipt(row2, receipt, expectedUid, content) {
   }
 }
 async function sendBotPreflightEvidence(topicId, content, clientMsgId, expectedUid, beforeSend) {
-  const config = loadConfig();
-  if (config.expectedBotUid !== expectedUid) throw new ArgumentError("Bot preflight config identity does not match signed packet principal");
-  const key = apiKey(config);
-  const me = record(await request(key, "/api/me", { method: "GET" }), "identity");
-  if (String(me.uid ?? "") !== expectedUid || String(me.account_type ?? "").toLowerCase() !== "bot") throw new CommandExecutionError3("CatsCo Bot API identity does not match configured Worker Bot");
+  const c = loadConfig();
+  if (c.expectedBotUid !== expectedUid) throw new ArgumentError("Bot preflight config identity does not match signed packet principal");
+  const key = apiKey(c);
+  await authenticated(c, key);
   beforeSend?.();
   const sent = record(await request(key, "/api/messages/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic_id: topicId, client_msg_id: clientMsgId, content, msg_type: "text", type: "text" }) }), "send receipt");
   const receipt = { messageId: String(sent.id ?? ""), topicId: String(sent.topic_id ?? ""), clientMsgId: String(sent.client_msg_id ?? ""), seqId: String(sent.seq_id ?? ""), duplicate: sent.duplicate === true, contentDigest: contentDigest(content) };
   if (!receipt.messageId || !receipt.seqId || receipt.messageId !== receipt.seqId || receipt.topicId !== topicId || String(sent.from_uid ?? "") !== expectedUid || receipt.clientMsgId !== clientMsgId) throw new CommandExecutionError3("CatsCo Bot API send receipt failed verification");
-  const history = historyRows(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`, { method: "GET" }));
-  const newest = history.at(-1);
-  if (!newest || !isExactLatestReceipt(newest, receipt, expectedUid, content)) {
-    throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
-  }
+  const history = record(await request(key, `/api/messages?topic_id=${encodeURIComponent(topicId)}&latest=true&limit=${MAX_RECEIPT_HISTORY}`, { method: "GET" }), "message receipt");
+  if (!Array.isArray(history.messages) || history.messages.length === 0 || history.messages.length > MAX_RECEIPT_HISTORY) throw new CommandExecutionError3("CatsCo Bot API returned invalid latest message receipt");
+  const newest = record(history.messages.at(-1), "message receipt");
+  if (!isExactLatestReceipt(newest, receipt, expectedUid, content)) throw new CommandExecutionError3("CatsCo Bot API receipt was not server-confirmed");
   return receipt;
 }
 
@@ -477,14 +454,16 @@ function validateWorkerPreflightPacket(packet, receivedTopic) {
   if (packet.workerSessionId !== sessionId) throw new ArgumentError3("preflight packet workerSessionId is not the canonical Worker session");
 }
 async function preflightReady(kwargs) {
+  if (kwargs["packet-file"] !== void 0) throw new ArgumentError3("packet-file is not supported; preflight reads the native Bot-authenticated Action");
+  const receivedTopic = String(kwargs["received-topic"] ?? "");
   let packet;
   try {
-    packet = workerPreflightPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs["packet-file"]))));
+    packet = workerPreflightPacketSchema.parse(await readNativePreflightPacket(receivedTopic));
   } catch (error) {
-    throw new ArgumentError3(error instanceof Error ? error.message : "invalid preflight packet file");
+    throw new ArgumentError3(error instanceof Error ? error.message : "invalid native Controller preflight packet");
   }
+  assertConfiguredControllerOwner(packet.ownerUid);
   verifyTrustedControllerPreflightPacket(packet);
-  const receivedTopic = String(kwargs["received-topic"] ?? "");
   validateWorkerPreflightPacket(packet, receivedTopic);
   const parts = [packet.actionKey, "worker_ready", packet.attemptId, String(packet.generation), String(packet.workItemRevision), packet.workerSessionId];
   const event = workerReady.parse({
@@ -513,12 +492,11 @@ async function preflightReady(kwargs) {
 cli({
   site: "loop",
   name: "preflight-ready",
-  description: "Worker-only: validate a native preflight packet and receipt-submit worker_ready",
+  description: "Worker-only: server-read the native preflight packet and receipt-submit worker_ready",
   access: "write",
   browser: false,
   strategy: Strategy.LOCAL,
   args: [
-    { name: "packet-file", help: "Relative raw Controller preflight packet JSON file", required: true },
     { name: "received-topic", help: "Native received CatsCo grp_<id> topic", required: true }
   ],
   columns: ["targetTopicId", "event", "receipt"],

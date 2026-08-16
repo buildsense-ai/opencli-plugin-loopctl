@@ -4,7 +4,7 @@ import { actionPacketSchema, receiptSchema, statusSchema, tickSchema, workerPref
 import { bundle, candidate, candidateSubmission, canonicalJson, parseAgentTaskFanout, parseAgentTaskStart, parseEvent, parseFanout, parseIntegrationPlan, parsePlan, registered, review, reviewSubmission, runtimeStarted, runtimeStartedSubmission, workerReady, workerReadySubmission, worktreeContractSchema } from './events.js'
 import { readConfinedFile, runLoopctl, unwrap } from './loopctl.js'
 import { attachTopicToProject, authenticatedCatscoUid, createAgentTaskTopic, createAttemptProject, createStandardTopic, resolveLoopProject, sendAttemptEvent } from './catsco.js'
-import { sendBotPreflightEvidence } from './catsco-bot-preflight.js'
+import { assertConfiguredControllerOwner, readNativePreflightPacket, sendBotPreflightEvidence } from './catsco-bot-preflight.js'
 import { openProvisionJournal, type ProvisionedTopicRecord } from './provisioning-journal.js'
 import { prepareWorkspaceFromPacket } from './workspace.js'
 import { verifyTrustedControllerPreflightPacket } from './controller-provenance.js'
@@ -273,13 +273,15 @@ function validateWorkerPreflightPacket(packet: WorkerPreflightPacket, receivedTo
 
 /** Mechanically emit only the receipt-attested worker_ready event for a native preflight packet. */
 export async function preflightReady(kwargs:any) {
-  let packet: WorkerPreflightPacket
-  try { packet=workerPreflightPacketSchema.parse(JSON.parse(await readConfinedFile(String(kwargs['packet-file'])))) }
-  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid preflight packet file') }
-  // Verify Controller provenance and the locally pinned key before invoking
-  // CatsCo or taking any action based on the self-carried packet fields.
-  verifyTrustedControllerPreflightPacket(packet)
+  if (kwargs['packet-file']!==undefined) throw new ArgumentError('packet-file is not supported; preflight reads the native Bot-authenticated Action')
   const receivedTopic=String(kwargs['received-topic']??'')
+  let packet: WorkerPreflightPacket
+  try { packet=workerPreflightPacketSchema.parse(await readNativePreflightPacket(receivedTopic)) }
+  catch(error) { throw new ArgumentError(error instanceof Error ? error.message : 'invalid native Controller preflight packet') }
+  // Owner binding is checked before accepting a Controller pin/signature. The
+  // native message source is also independently bound to this same UID.
+  assertConfiguredControllerOwner(packet.ownerUid)
+  verifyTrustedControllerPreflightPacket(packet)
   // The Controller signature covers catscoProjectId, worker/evidence topics,
   // principals, and duplicated action fields. Bot REST has no read-only
   // Project/group topology endpoint, so this is the Controller's immutable

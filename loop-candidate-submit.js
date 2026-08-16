@@ -268,13 +268,7 @@ import { z as z4 } from "zod";
 var MAX_CONFIG_BYTES = 16 * 1024;
 var MAX_KEY_BYTES = 8 * 1024;
 var MAX_RESPONSE_BYTES = 128 * 1024;
-var configSchema = z4.object({
-  version: z4.literal(1),
-  transport: z4.literal("catsco-bot-preflight-v1"),
-  httpBaseUrl: z4.string().min(1),
-  expectedBotUid: z4.string().regex(/^[1-9]\d*$/),
-  apiKeyFile: z4.string().min(1)
-}).strict();
+var configSchema = z4.object({ version: z4.literal(1), transport: z4.literal("catsco-bot-preflight-v1"), httpBaseUrl: z4.string().min(1), expectedBotUid: z4.string().regex(/^[1-9]\d*$/), controllerUid: z4.literal("602").default("602"), apiKeyFile: z4.string().min(1) }).strict();
 
 // src/lib/exclusive-lock.ts
 var DEFAULT_STALE_MS = 15 * 6e4;
